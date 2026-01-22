@@ -39,18 +39,28 @@ upsell_agent(user exploration) -> data analyst(eda) -> signal agent(signal analy
 
 Left off status and next focus (for tomorrow):
 
-  - upsell_ranker_full/v0.0.2/upsell_agent/agent.py now uses fetch_company_homepage(url) instead of google_search, builds a company summary from homepage HTML, and then calls dwh_analyst (sub-agent) before emitting JSON.
-  - dwh_analyst and signal_agent are wired as sub-agents, but dwh_analyst currently returns without doing real DWH work, so the output falls back to generic upsell proposals.
-  - We agreed next work is on dwh_analyst to implement:
-      - PostHog DWH access (read-only).
-      - EDA: table discovery, schema inspection, event/user/client table identification.
-      - Join strategy across sources to map users/clients.
-      - Caching to avoid repeated calls (check v0.0.1 for existing caching approach).
+Implemented the LLM‑as‑judge loop for signal_agent, added a safe HogQL executor with a hard query budget, and tightened DWH join discovery formatting.
 
-  Notes for tomorrow:
+  What changed:
 
-  - Extend dwh_analyst with a real PostHog DWH tool (stub if MCP not ready).
-  - Add minimal caching for homepage fetch + DWH metadata/queries (reuse v0.0.1 patterns).
-  - Ensure the chain completes: upsell_agent → dwh_analyst (EDA) → signal_agent (SQL signals) → upsell_agent (rankings).
+  - Added safe query tool with budget + read‑only enforcement in upsell_ranker_full/v0.0.2/signal_agent/tools.py.
+      - Env vars: SIGNAL_AGENT_MAX_QUERIES (default 6), SIGNAL_AGENT_MAX_ROWS (default 200).
+  - Rebuilt signal_agent as a LoopAgent with worker + judge in upsell_ranker_full/v0.0.2/signal_agent/agent.py.
+      - Worker must run real SQL via run_posthog_query and return detections.
+      - Judge enforces actual query usage + read‑only SQL before exiting the loop.
+  - Updated DWH EDA join proposals to explicit table/column pairs + overlap evidence in upsell_ranker_full/v0.0.2/dwh_analyst/tools.py.
+  - Instruction now asks to pass table_summaries + join_candidates to signal agent in upsell_ranker_full/v0.0.2/dwh_analyst/agent.py.
 
-  If you want me to prep a caching helper and PostHog tool stub in v0.0.2 to start the next session, just say the word.
+  Notes on join discovery improvements already applied:
+
+  - Empty samples are only surfaced as "<empty>" if all sampled values are empty.
+  - Join proposals are now explicit pairs like:
+      - tables: ["authsupabase_users", "peoplegooglesheets_people_clean"]
+      - columns: ["email", "email_addresses"]
+
+  If you want the judge to enforce a stricter rule (e.g., at least N detections per signal), say the word.
+
+  Next steps:
+
+  1. Set SIGNAL_AGENT_MAX_QUERIES and SIGNAL_AGENT_MAX_ROWS in your runtime env.
+  2. Re-run a full flow and check that signal_summary.signals[].sql + detections are populated from real query results.
