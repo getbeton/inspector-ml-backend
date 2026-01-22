@@ -12,10 +12,17 @@ if AGENTOPS_API_KEY:
 
 MODEL = Gemini(model="gemini-2.5-flash")
 
+from shared.cache import cache_read_json, cache_write_json
+
 def fetch_company_homepage(url: str, timeout_sec: int = 12) -> Dict[str, Any]:
+    cache_key = f"homepage_fetch:v1:url={url}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
     try:
         resp = requests.get(url, timeout=timeout_sec)
-        return {
+        payload = {
             "status": "success",
             "url": url,
             "status_code": resp.status_code,
@@ -23,11 +30,13 @@ def fetch_company_homepage(url: str, timeout_sec: int = 12) -> Dict[str, Any]:
             "text": resp.text[:120_000],
         }
     except Exception as exc:
-        return {
+        payload = {
             "status": "error",
             "url": url,
             "error": str(exc),
         }
+    cache_write_json(cache_key, payload)
+    return payload
 
 from dwh_analyst.agent import root_agent as dwh_analyst
 
