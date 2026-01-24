@@ -43,7 +43,7 @@ from dwh_analyst.agent import root_agent as dwh_analyst
 root_agent = Agent(
     model=MODEL,
     name="upsell_agent",
-    description="Explores user company context, orchestrates DWH analysis, and returns upsell rankings.",
+    description="Explores user company context, orchestrates DWH analysis, and returns demo-friendly JSON.",
     tools=[
         fetch_company_homepage,
     ],
@@ -55,9 +55,8 @@ root_agent = Agent(
         "- Read-only behavior: never write, mutate, or delete data. Only read and summarize.\n"
         "- Use tools conservatively and explain missing data as assumptions.\n"
         "- Prefer the company's official website and avoid domain parking/sale pages or unrelated directories.\n"
-        "- Ratings must be floats in the range 0-100.\n"
-        "- Use client names from the DWH for upsell_rankings[].name.\n"
-        "- Include the product/plan in upsell_rankings[].proposal.\n"
+        "- Never include secrets in your output (tokens, API keys).\n"
+        "- Output JSON only. No Markdown, no code fences.\n"
         "\n"
         "Workflow:\n"
         "1) If the input does not include a website URL, ask for it.\n"
@@ -65,18 +64,19 @@ root_agent = Agent(
         "   Summarize what the company sells and how (B2B vs PLG, main product, ICP, pricing model).\n"
         "   If the page cannot be fetched, proceed using the URL host and explicit assumptions.\n"
         "3) Call the dwh_analyst sub-agent with a payload that includes: website_url, company_summary, assumptions.\n"
-        "   The analyst should explore the DWH without assuming schema or table names and should call signal_agent.\n"
-        "4) After dwh_analyst returns with signal_summary, produce the final response as JSON only. Do not wrap in Markdown.\n"
+        "   If input includes posthog_token, posthog_host, or posthog_project_id, pass them along.\n"
+        "4) After dwh_analyst returns, embed its full JSON as dwh_analysis and expose its summary_text as dwh_summary_text.\n"
+        "   Always produce the final JSON response, even if dwh_analyst output is partial or missing fields.\n"
+        "   Do not stop after transfer_to_agent; you must return the final JSON yourself.\n"
         "\n"
         "Output JSON (schema is provisional):\n"
         "{\n"
-        "  \"schema_version\": \"v0.0.1\",\n"
+        "  \"schema_version\": \"v0.0.2\",\n"
+        "  \"upsell_summary_text\": \"2-4 sentences summarizing the website + suggested DWH focus.\",\n"
         "  \"company_summary\": {\"website\": \"...\", \"business_model\": \"...\", \"product\": \"...\", \"icp\": \"...\", \"assumptions\": []},\n"
-        "  \"dwh_summary\": {\"status\": \"...\", \"notes\": \"...\", \"tables\": [], \"metrics\": []},\n"
-        "  \"signal_summary\": {\"status\": \"...\", \"signals\": [], \"notes\": \"...\"},\n"
-        "  \"upsell_rankings\": [\n"
-        "     {\"name\": \"...\", \"rating\": 0.0, \"proposal\": \"<product_or_plan>: <rationale>\", \"reasons\": [], \"next_steps\": []}\n"
-        "  ],\n"
+        "  \"dwh_request_suggestions\": {\"summary\": \"1-3 sentences covering the requested DWH follow-ups.\", \"items\": []},\n"
+        "  \"dwh_analysis\": {},\n"
+        "  \"dwh_summary_text\": \"2-4 sentences summarizing DWH tables + join candidates.\",\n"
         "  \"notes\": []\n"
         "}\n"
         "\n"

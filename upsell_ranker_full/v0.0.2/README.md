@@ -21,19 +21,12 @@ Consider it a basic version of pd.describe() but with capabilities to adapt to d
 tailored to specific user database naming conventions. Summary and assumptions on available data is made by this agent as
 well as suggestions on possible joins and filtering. 
 
-This is forwarded to the Signal agent that picks most promising
-upsell opportunities according to generic analysis and writes SQL queries that perform basic signal analysis. Since such
-queries may be harmfull we pair it with LLM judge that checks each query for potential harmful patterns, to prevent their
-execution. Queries are then executed in search of possible signals to which then signal agent writes a short description
-of the signal and its significance. 
-
-Finally this summary, paired with EDA summary and information about the company is returned
-back to the upsell_agent to generate final rankings for upsell opportunities, based on signals, combined with a sales
-readable explanation, potential salesplays and next steps for the sales team to perform.
+For the MVP demo we stop after DWH exploration and return a structured JSON summary of discovered tables, columns,
+sample values, and join suggestions, plus a website summary from upsell_agent.
 
 ## Agent schema
 
-upsell_agent(user exploration) -> data analyst(eda) -> signal agent(signal analysis) -> upsell_agent(rankings+steps)
+MVP: upsell_agent(user exploration) -> data analyst(eda) -> upsell_agent(demo JSON)
 
 ## Next steps
 
@@ -49,7 +42,7 @@ Implemented the LLM‑as‑judge loop for signal_agent, added a safe HogQL execu
       - Worker must run real SQL via run_posthog_query and return detections.
       - Judge enforces actual query usage + read‑only SQL before exiting the loop.
   - Updated DWH EDA join proposals to explicit table/column pairs + overlap evidence in upsell_ranker_full/v0.0.2/dwh_analyst/tools.py.
-  - Instruction now asks to pass table_summaries + join_candidates to signal agent in upsell_ranker_full/v0.0.2/dwh_analyst/agent.py.
+  - Signal agent is now paused for the MVP demo; dwh_analyst returns table/column summaries and join suggestions directly.
 
   Notes on join discovery improvements already applied:
 
@@ -58,9 +51,95 @@ Implemented the LLM‑as‑judge loop for signal_agent, added a safe HogQL execu
       - tables: ["authsupabase_users", "peoplegooglesheets_people_clean"]
       - columns: ["email", "email_addresses"]
 
-  If you want the judge to enforce a stricter rule (e.g., at least N detections per signal), say the word.
+  Signal agent resume (after MVP demo):
 
-  Next steps:
+  1. Re-enable dwh_analyst -> signal_agent handoff and restore signal_summary in the final JSON.
+  2. Set SIGNAL_AGENT_MAX_QUERIES and SIGNAL_AGENT_MAX_ROWS in your runtime env.
+  3. Re-run a full flow and check that signal_summary.signals[].sql + detections are populated from real query results.
+  4. Decide if the judge should enforce stricter rules (e.g., min detections per signal).
 
-  1. Set SIGNAL_AGENT_MAX_QUERIES and SIGNAL_AGENT_MAX_ROWS in your runtime env.
-  2. Re-run a full flow and check that signal_summary.signals[].sql + detections are populated from real query results.
+## Demo API payload/response (MVP)
+
+Request payload (example):
+
+```json
+{
+  "website_url": "https://example.com",
+  "posthog_token": "phx_your_personal_api_key",
+  "posthog_host": "https://us.posthog.com",
+  "posthog_project_id": "12345"
+}
+```
+
+Response shape (example):
+
+```json
+{
+  "schema_version": "v0.0.2",
+  "upsell_summary_text": "Example summary of the website and where to focus the DWH exploration.",
+  "company_summary": {
+    "website": "https://example.com",
+    "business_model": "B2B",
+    "product": "Customer analytics platform",
+    "icp": "Mid-market SaaS",
+    "assumptions": [
+      "Pricing details were not visible on the homepage."
+    ]
+  },
+  "dwh_request_suggestions": {
+    "summary": "Request monthly revenue tables and account ownership mappings to refine join accuracy.",
+    "items": [
+      {"topic": "revenue_table", "detail": "Expose Stripe invoices or MRR snapshots per account."},
+      {"topic": "account_owner", "detail": "Map accounts to CSM/AE ownership for prioritization."}
+    ]
+  },
+  "dwh_analysis": {
+    "schema_version": "v0.0.1",
+    "summary_text": "Found 6 tables with user and billing context; join candidates suggest email-based links.",
+    "dwh_summary": {
+      "status": "ok",
+      "notes": "Sampled 5 rows per table with 8 columns each.",
+      "tables": [],
+      "joins": [],
+      "metrics": []
+    },
+    "table_summaries": [],
+    "join_candidates": []
+  },
+  "dwh_summary_text": "Primary candidate tables include users and invoices; joins likely via email or customer_id.",
+  "notes": []
+}
+```
+
+## Demo test template
+
+If you have a running ADK api_server, create a session and then call `/run` (adjust paths if your server expects a specific route):
+
+```bash
+export API_URL="http://127.0.0.1:8000"
+export APP_NAME="upsell_agent"
+export USER_ID="u_123"
+export SESSION_ID="s_123"
+export WEBSITE_URL="https://example.com"
+export POSTHOG_TOKEN="phx_your_personal_api_key"
+export POSTHOG_HOST="https://us.posthog.com"
+export POSTHOG_PROJECT_ID="12345"
+
+curl -sS -X POST "$API_URL/apps/$APP_NAME/users/$USER_ID/sessions/$SESSION_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"created_by": "mvp_demo"}'
+
+curl -sS -X POST "$API_URL/run" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "appName": "'"$APP_NAME"'",
+    "userId": "'"$USER_ID"'",
+    "sessionId": "'"$SESSION_ID"'",
+    "newMessage": {
+      "role": "user",
+      "parts": [{
+        "text": "Analyze website: '"$WEBSITE_URL"' and use PostHog token '"$POSTHOG_TOKEN"' with host '"$POSTHOG_HOST"' and project '"$POSTHOG_PROJECT_ID"'. Return JSON only."
+      }]
+    }
+  }' | jq .
+```

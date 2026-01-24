@@ -161,6 +161,9 @@ def _summarize_sample(columns: List[str], rows: List[list]) -> Dict[str, Any]:
 
 def posthog_dwh_eda(
     project_id: str = "",
+    posthog_project_id: str = "",
+    posthog_token: str = "",
+    posthog_host: str = "",
     max_tables: int = 40,
     sample_rows: int = 5,
     sample_columns: int = 8,
@@ -168,8 +171,8 @@ def posthog_dwh_eda(
     """
     PostHog DWH EDA using warehouse tables metadata + targeted samples.
     """
-    token = os.getenv("POSTHOG_PERSONAL_API_KEY", "").strip()
-    host = os.getenv("POSTHOG_HOST", "https://us.posthog.com").strip().rstrip("/")
+    token = (posthog_token or os.getenv("POSTHOG_PERSONAL_API_KEY", "")).strip()
+    host = (posthog_host or os.getenv("POSTHOG_HOST", "https://us.posthog.com")).strip().rstrip("/")
 
     if not token:
         return {
@@ -179,7 +182,7 @@ def posthog_dwh_eda(
             "project_id": project_id or os.getenv("POSTHOG_PROJECT_ID", "").strip(),
         }
 
-    project_id = (project_id or os.getenv("POSTHOG_PROJECT_ID", "")).strip()
+    project_id = (project_id or posthog_project_id or os.getenv("POSTHOG_PROJECT_ID", "")).strip()
     projects = None
     if not project_id:
         org = _ph_get(host, token, "/api/organizations/@current")
