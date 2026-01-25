@@ -9,7 +9,7 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model="gemini-2.5-flash")
+MODEL = Gemini(model="gemini-3-flash-preview")
 
 from .tools import posthog_dwh_eda
 
