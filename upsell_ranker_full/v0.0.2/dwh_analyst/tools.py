@@ -167,6 +167,7 @@ def posthog_dwh_eda(
     max_tables: int = 40,
     sample_rows: int = 5,
     sample_columns: int = 8,
+    tool_context: Any = None,
 ) -> Dict[str, Any]:
     """
     PostHog DWH EDA using warehouse tables metadata + targeted samples.
@@ -175,12 +176,17 @@ def posthog_dwh_eda(
     host = (posthog_host or os.getenv("POSTHOG_HOST", "https://us.posthog.com")).strip().rstrip("/")
 
     if not token:
-        return {
+        result = {
             "status": "unavailable",
             "reason": "POSTHOG_PERSONAL_API_KEY missing",
             "host": host,
             "project_id": project_id or os.getenv("POSTHOG_PROJECT_ID", "").strip(),
         }
+        if tool_context is not None:
+            state = getattr(tool_context, "state", None)
+            if state is not None:
+                state["posthog_dwh_eda"] = result
+        return result
 
     project_id = (project_id or posthog_project_id or os.getenv("POSTHOG_PROJECT_ID", "")).strip()
     projects = None
@@ -193,22 +199,32 @@ def posthog_dwh_eda(
             project_id = str(results[0].get("id"))
 
     if not project_id:
-        return {
+        result = {
             "status": "error",
             "reason": "POSTHOG_PROJECT_ID not found",
             "host": host,
             "projects": projects,
         }
+        if tool_context is not None:
+            state = getattr(tool_context, "state", None)
+            if state is not None:
+                state["posthog_dwh_eda"] = result
+        return result
 
     warehouse = _posthog_warehouse_tables(host, token, project_id)
     if not warehouse.get("ok"):
-        return {
+        result = {
             "status": "error",
             "reason": "warehouse_tables_failed",
             "host": host,
             "project_id": project_id,
             "warehouse": warehouse,
         }
+        if tool_context is not None:
+            state = getattr(tool_context, "state", None)
+            if state is not None:
+                state["posthog_dwh_eda"] = result
+        return result
 
     tables_data = warehouse.get("data") or {}
     tables = tables_data.get("results") or []
@@ -304,7 +320,7 @@ def posthog_dwh_eda(
                     }
                 )
 
-    return {
+    result = {
         "status": "ok",
         "host": host,
         "project_id": project_id,
@@ -314,3 +330,8 @@ def posthog_dwh_eda(
         "join_hints": join_hints,
         "join_candidates": join_candidates,
     }
+    if tool_context is not None:
+        state = getattr(tool_context, "state", None)
+        if state is not None:
+            state["posthog_dwh_eda"] = result
+    return result
