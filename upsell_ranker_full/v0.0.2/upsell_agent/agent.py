@@ -13,9 +13,27 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model="gemini-3-flash-preview")
+MODEL = Gemini(model=os.getenv("UPSELL_AGENT_MODEL", "gemini-3-flash-preview"))
 
 from shared.cache import cache_read_json, cache_write_json
+from shared.inspector import inspector_env, inspector_post
+
+
+def _infer_is_b2b(business_model: str) -> bool:
+    return "b2b" in business_model.lower()
+
+
+def _infer_plg_type(business_model: str) -> str:
+    lower = business_model.lower()
+    has_plg = "plg" in lower or "self-serve" in lower or "self serve" in lower
+    has_sales = "sales-led" in lower or "sales led" in lower
+    if has_plg and has_sales:
+        return "hybrid"
+    if has_plg:
+        return "plg"
+    if has_sales:
+        return "slg"
+    return "not_applicable"
 
 class CompanySummary(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -39,6 +57,7 @@ class WebsiteContext(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     website_url: str = ""
+    workspace_id: str = ""
     company_summary: CompanySummary = Field(default_factory=CompanySummary)
     assumptions: List[str] = Field(default_factory=list)
     upsell_summary_text: str = ""
@@ -53,6 +72,7 @@ def emit_website_summary(
     pricing_model: Any,
     upsell_summary_text: str,
     dwh_request_suggestions: Dict[str, Any],
+    workspace_id: str = "",
     assumptions: List[str] | None = None,
     tool_context: Any = None,
 ) -> Dict[str, Any]:
@@ -90,6 +110,7 @@ def emit_website_summary(
     """
     payload: Dict[str, Any] = {
         "website_url": website_url,
+        "workspace_id": workspace_id,
         "company_summary": {
             "website": website_url,
             "business_model": business_model,
@@ -133,9 +154,52 @@ def emit_website_summary(
         if state is not None:
             state["website_context"] = data
             state["website_summary"] = data
+            if workspace_id:
+                state["workspace_id"] = workspace_id
         actions = getattr(tool_context, "actions", None)
         if actions is not None:
             actions.skip_summarization = True
+
+    website_exploration = None
+    if workspace_id:
+        website_exploration = {
+            "workspace_id": workspace_id,
+            "is_b2b": _infer_is_b2b(business_model),
+            "plg_type": _infer_plg_type(business_model),
+            "website_url": website_url,
+            "product_description": product,
+            "icp_description": icp,
+            "pricing_model": pricing_model,
+            "product_assumptions": assumptions or [],
+        }
+        env = inspector_env()
+        if env["agent_secret"]:
+            try:
+                result = inspector_post(
+                    env["url"],
+                    "/api/agent/data/website-exploration",
+                    env["agent_secret"],
+                    env["vercel_protection"],
+                    website_exploration,
+                    timeout=60,
+                    include_vercel=True,
+                )
+                if tool_context is not None:
+                    state = getattr(tool_context, "state", None)
+                    if state is not None:
+                        state["inspector_website_write"] = result
+                        state["website_exploration"] = website_exploration
+            except Exception as exc:
+                if tool_context is not None:
+                    state = getattr(tool_context, "state", None)
+                    if state is not None:
+                        state["inspector_website_write"] = {"status": "error", "error": str(exc)}
+                        state["website_exploration"] = website_exploration
+        elif tool_context is not None:
+            state = getattr(tool_context, "state", None)
+            if state is not None:
+                state["inspector_website_write"] = {"status": "skipped", "reason": "missing_agent_secret"}
+                state["website_exploration"] = website_exploration
     return data
 
 
@@ -205,7 +269,8 @@ upsell_worker = Agent(
         "   If the page cannot be fetched, proceed using the URL host and explicit assumptions.\n"
         "3) Build a website context payload with: website_url, business_model, product, icp,\n"
         "   pricing_model, assumptions, upsell_summary_text, and dwh_request_suggestions.\n"
-        "4) Call emit_website_summary exactly once with that payload.\n"
+        "4) Extract the Inspector workspace_id from the input and pass it to emit_website_summary.\n"
+        "5) Call emit_website_summary exactly once with that payload.\n"
         "   Do not leave fields blank; fill business_model, product, icp, and pricing_model from the homepage.\n"
         "   If pricing is unclear, add 2-4 assumptions about pricing/PLG motion instead of leaving fields empty.\n"
         "\n"
@@ -218,6 +283,7 @@ upsell_worker = Agent(
         "  \"icp\": \"...\",\n"
         "  \"pricing_model\": \"...\",\n"
         "  \"assumptions\": [],\n"
+        "  \"workspace_id\": \"...\",\n"
         "  \"dwh_request_suggestions\": {\"summary\": \"1-3 sentences covering the requested DWH follow-ups.\", \"items\": []}\n"
         "}\n"
         "\n"

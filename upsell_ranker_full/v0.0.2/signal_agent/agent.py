@@ -12,7 +12,7 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model="gemini-2.5-flash")
+MODEL = Gemini(model=os.getenv("SIGNAL_AGENT_MODEL", "gemini-2.5-flash"))
 
 signal_worker = LlmAgent(
     name="signal_worker",
@@ -24,6 +24,7 @@ signal_worker = LlmAgent(
         "Hard constraints:\n"
         "- Read-only behavior only. Never write, mutate, or delete data.\n"
         "- Use run_posthog_query for all SQL; queries must be SELECT/WITH only.\n"
+        "- Always pass the Inspector session_id from the input into run_posthog_query.\n"
         "- Keep queries small and safe; always include LIMIT and narrow filters.\n"
         "\n"
         "Workflow:\n"

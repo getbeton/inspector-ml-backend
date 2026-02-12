@@ -7,7 +7,7 @@ Agent - our system that analyzes customer behavior and provides upsell opportuni
 Client - company(B2B) or user(PLG) of our user services that may be potential upsell targets we want to highlight.
 
 ## Description
-This system will rank upsell opportunities based on the client's behavior that is observed in our user Posthog DWH. 
+This system will rank upsell opportunities based on the client's behavior that is observed in the user's DWH via Inspector. 
 It uses basic signal analysis to observe clients interactions with users product and predict which products or services are most likely to be upsold to each client.
 
 
@@ -16,7 +16,7 @@ Since we consider two main ways of upsale at the moment: B2B and PLG we also ana
 We gather this data based on user input parameter for company website or try to deduce it via email.
 Then we make initial assumptions on what and how to upsell and forward this summary to data analyst agent.  
 
-Data analyst performs basic EDA in Posthog DWH, connects datasources to provide comprehensive signal summary on each client. 
+Data analyst performs basic EDA via Inspector's DWH proxy, connects datasources to provide comprehensive signal summary on each client. 
 Consider it a basic version of pd.describe() but with capabilities to adapt to different parameter namings that may be
 tailored to specific user database naming conventions. Summary and assumptions on available data is made by this agent as
 well as suggestions on possible joins and filtering. 
@@ -65,9 +65,8 @@ Request payload (example):
 ```json
 {
   "website_url": "https://example.com",
-  "posthog_token": "phx_your_personal_api_key",
-  "posthog_host": "https://us.posthog.com",
-  "posthog_project_id": "12345"
+  "workspace_id": "ws_123",
+  "session_id": "sess_456"
 }
 ```
 
@@ -121,9 +120,8 @@ export APP_NAME="upsell_agent"
 export USER_ID="u_123"
 export SESSION_ID="s_123"
 export WEBSITE_URL="https://example.com"
-export POSTHOG_TOKEN="phx_your_personal_api_key"
-export POSTHOG_HOST="https://us.posthog.com"
-export POSTHOG_PROJECT_ID="12345"
+export WORKSPACE_ID="ws_123"
+export INSPECTOR_SESSION_ID="sess_456"
 
 curl -sS -X POST "$API_URL/apps/$APP_NAME/users/$USER_ID/sessions/$SESSION_ID" \
   -H "Content-Type: application/json" \
@@ -138,8 +136,46 @@ curl -sS -X POST "$API_URL/run" \
     "newMessage": {
       "role": "user",
       "parts": [{
-        "text": "Analyze website: '"$WEBSITE_URL"' and use PostHog token '"$POSTHOG_TOKEN"' with host '"$POSTHOG_HOST"' and project '"$POSTHOG_PROJECT_ID"'. Return JSON only."
+        "text": "Analyze website: '"$WEBSITE_URL"'. Use the Inspector callback URL to query DWH via proxy routes. Your session ID for Inspector callbacks is: '"$INSPECTOR_SESSION_ID"'. Your workspace ID is: '"$WORKSPACE_ID"'. Return JSON only."
       }]
     }
   }' | jq .
+```
+
+## Inspector Integration
+
+The agents use Inspector for DWH access and data writes. Session and workspace IDs are passed in the user prompt (not via env vars).
+
+Required environment variables (runtime):
+
+```bash
+export INSPECTOR_URL="https://staging.getbeton.org"
+export AGENT_SECRET="your_agent_secret"
+export VERCEL_PROTECTION="your_vercel_bypass_token"
+```
+
+Optional runtime tuning:
+
+```bash
+export SIGNAL_AGENT_MAX_QUERIES="6"
+export SIGNAL_AGENT_MAX_ROWS="200"
+```
+
+Optional per-agent Gemini model overrides:
+
+```bash
+export UPSELL_AGENT_MODEL="gemini-3-flash-preview"
+export SIGNAL_AGENT_MODEL="gemini-2.5-flash"
+export DWH_ANALYST_MODEL="gemini-3-flash-preview"
+```
+
+Supported Gemini model values:
+`gemini-2.0-flash-lite`, `gemini-2.0-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-2.5-flash`, `gemini-3-flash-preview`, `gemini-3-pro-preview`
+
+Prompt requirements:
+
+The incoming prompt must include both IDs so the agents can pass them into Inspector tool calls, for example:
+
+```
+Analyze website: 'https://example.com'. Use the Inspector callback URL to query DWH via proxy routes. Your session ID for Inspector callbacks is: sess_456. Your workspace ID is: ws_123. Return JSON only.
 ```

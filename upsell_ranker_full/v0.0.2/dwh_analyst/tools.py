@@ -1,80 +1,16 @@
-import json
-import os
 from typing import Any, Dict, List, Optional
 
-import requests
-
 from shared.cache import cache_read_json, cache_write_json
+from shared.inspector import inspector_env, inspector_get
 
 
-def _ph_headers(token: str) -> Dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-
-def _ph_get(host: str, token: str, path: str, params: Optional[dict] = None) -> dict:
-    resp = requests.get(
-        f"{host}{path}",
-        headers=_ph_headers(token),
-        params=params or {},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _extract_columns(payload: dict) -> Optional[list]:
-    cols_raw = payload.get("columns")
-    if isinstance(cols_raw, list) and cols_raw:
-        if isinstance(cols_raw[0], dict):
-            return [c.get("name") for c in cols_raw]
-        if isinstance(cols_raw[0], str):
-            return cols_raw
-
-    types_raw = payload.get("types")
-    if isinstance(types_raw, list) and types_raw and isinstance(types_raw[0], list):
-        return [t[0] for t in types_raw if t]
-
-    return None
-
-
-def _posthog_hogql_query(host: str, token: str, project_id: str, hogql: str) -> Dict[str, Any]:
-    cache_key = f"posthog_hogql:v1:project_id={project_id}:query={hogql}"
-    cached = cache_read_json(cache_key)
-    if isinstance(cached, dict):
-        return {
-            "ok": True,
-            "cached": True,
-            "columns": _extract_columns(cached),
-            "rows": cached.get("results", []),
-        }
-
-    url = f"{host}/api/projects/{project_id}/query/"
-    payload = {"query": {"kind": "HogQLQuery", "query": hogql}}
-    resp = requests.post(url, headers=_ph_headers(token), data=json.dumps(payload), timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
-    cache_write_json(cache_key, data)
-    return {
-        "ok": True,
-        "cached": False,
-        "columns": _extract_columns(data),
-        "rows": data.get("results", []),
-    }
-
-
-def _posthog_warehouse_tables(host: str, token: str, project_id: str) -> Dict[str, Any]:
-    cache_key = f"posthog_warehouse_tables:v1:project_id={project_id}"
-    cached = cache_read_json(cache_key)
-    if isinstance(cached, dict):
-        return {"ok": True, "cached": True, "data": cached}
-
-    data = _ph_get(host, token, f"/api/projects/{project_id}/warehouse_tables/")
-    cache_write_json(cache_key, data)
-    return {"ok": True, "cached": False, "data": data}
-
-
-def _quote_ident(name: str) -> str:
-    return f"`{name.replace('`', '``')}`"
+def _extract_columns_from_meta(columns_meta: List[Dict[str, Any]]) -> List[str]:
+    columns = []
+    for col in columns_meta:
+        name = col.get("col_name") or col.get("name") or col.get("col_id")
+        if name:
+            columns.append(str(name))
+    return columns
 
 
 def _normalize_value(value: Any) -> Optional[str]:
@@ -131,103 +67,140 @@ def _infer_column_roles(column: str, samples: List[str]) -> List[str]:
     return roles
 
 
-def _summarize_sample(columns: List[str], rows: List[list]) -> Dict[str, Any]:
+def _summarize_columns_from_examples(
+    columns_meta: List[Dict[str, Any]],
+    max_examples: int = 3,
+) -> Dict[str, Any]:
     summary: Dict[str, Any] = {"columns": {}}
-    max_examples = 3
-    for idx, col in enumerate(columns):
+    for col in columns_meta:
+        name = col.get("col_name") or col.get("name") or col.get("col_id")
+        if not name:
+            continue
+        raw_examples = col.get("examples") or []
         values = []
-        for row in rows:
-            if idx >= len(row):
-                continue
-            value = _normalize_value(row[idx])
-            if value is not None:
-                values.append(value)
+        for value in raw_examples:
+            norm = _normalize_value(value)
+            if norm is not None:
+                values.append(norm)
         unique_samples = []
         for value in values:
             if value not in unique_samples:
                 unique_samples.append(value)
             if len(unique_samples) >= max_examples:
                 break
-        if not unique_samples and rows:
+        if not unique_samples and raw_examples:
             unique_samples = ["<empty>"]
-        summary["columns"][col] = {
+        summary["columns"][str(name)] = {
             "non_empty": len(values),
-            "empty": max(0, len(rows) - len(values)),
+            "empty": 0,
             "samples": unique_samples,
-            "roles": _infer_column_roles(col, unique_samples),
+            "roles": _infer_column_roles(str(name), unique_samples),
         }
     return summary
 
 
-def posthog_dwh_eda(
-    project_id: str = "",
-    posthog_project_id: str = "",
-    posthog_token: str = "",
-    posthog_host: str = "",
+def _inspector_list_tables(
+    url: str,
+    agent_secret: str,
+    vercel_protection: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    cache_key = f"inspector_list_tables:v1:session_id={session_id}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        return {"ok": True, "cached": True, "data": cached}
+
+    data = inspector_get(
+        url,
+        "/api/agent/list-tables",
+        agent_secret,
+        vercel_protection,
+        params={"session_id": session_id},
+        timeout=60,
+    )
+    cache_write_json(cache_key, data)
+    return {"ok": True, "cached": False, "data": data}
+
+
+def _inspector_list_columns(
+    url: str,
+    agent_secret: str,
+    vercel_protection: str,
+    session_id: str,
+    table_id: str,
+) -> Dict[str, Any]:
+    cache_key = f"inspector_list_columns:v1:session_id={session_id}:table_id={table_id}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        return {"ok": True, "cached": True, "data": cached}
+
+    data = inspector_get(
+        url,
+        "/api/agent/list-columns",
+        agent_secret,
+        vercel_protection,
+        params={"session_id": session_id, "table_id": table_id},
+        timeout=60,
+    )
+    cache_write_json(cache_key, data)
+    return {"ok": True, "cached": False, "data": data}
+
+
+def inspector_dwh_eda(
+    session_id: str = "",
     max_tables: int = 40,
-    sample_rows: int = 5,
-    sample_columns: int = 8,
+    sample_columns: int = 12,
     tool_context: Any = None,
 ) -> Dict[str, Any]:
     """
-    PostHog DWH EDA using warehouse tables metadata + targeted samples.
+    Inspector DWH EDA using list-tables/list-columns metadata + 3-row samples.
     """
-    token = (posthog_token or os.getenv("POSTHOG_PERSONAL_API_KEY", "")).strip()
-    host = (posthog_host or os.getenv("POSTHOG_HOST", "https://us.posthog.com")).strip().rstrip("/")
+    env = inspector_env()
+    url = env["url"]
+    agent_secret = env["agent_secret"]
+    vercel_protection = env["vercel_protection"]
 
-    if not token:
+    session_id = session_id.strip()
+    if not session_id:
         result = {
             "status": "unavailable",
-            "reason": "POSTHOG_PERSONAL_API_KEY missing",
-            "host": host,
-            "project_id": project_id or os.getenv("POSTHOG_PROJECT_ID", "").strip(),
+            "reason": "missing_session_id",
+            "inspector_url": url,
         }
         if tool_context is not None:
             state = getattr(tool_context, "state", None)
             if state is not None:
-                state["posthog_dwh_eda"] = result
+                state["inspector_dwh_eda"] = result
         return result
 
-    project_id = (project_id or posthog_project_id or os.getenv("POSTHOG_PROJECT_ID", "")).strip()
-    projects = None
-    if not project_id:
-        org = _ph_get(host, token, "/api/organizations/@current")
-        org_id = org.get("id")
-        projects = _ph_get(host, token, f"/api/organizations/{org_id}/projects/", params={"limit": 100})
-        results = projects.get("results", []) if isinstance(projects, dict) else []
-        if results:
-            project_id = str(results[0].get("id"))
+    if not agent_secret:
+        result = {
+            "status": "unavailable",
+            "reason": "missing_inspector_agent_secret",
+            "inspector_url": url,
+        }
+        if tool_context is not None:
+            state = getattr(tool_context, "state", None)
+            if state is not None:
+                state["inspector_dwh_eda"] = result
+        return result
 
-    if not project_id:
+    tables_payload = _inspector_list_tables(url, agent_secret, vercel_protection, session_id)
+    if not tables_payload.get("ok"):
         result = {
             "status": "error",
-            "reason": "POSTHOG_PROJECT_ID not found",
-            "host": host,
-            "projects": projects,
+            "reason": "list_tables_failed",
+            "inspector_url": url,
+            "tables": tables_payload,
         }
         if tool_context is not None:
             state = getattr(tool_context, "state", None)
             if state is not None:
-                state["posthog_dwh_eda"] = result
+                state["inspector_dwh_eda"] = result
         return result
 
-    warehouse = _posthog_warehouse_tables(host, token, project_id)
-    if not warehouse.get("ok"):
-        result = {
-            "status": "error",
-            "reason": "warehouse_tables_failed",
-            "host": host,
-            "project_id": project_id,
-            "warehouse": warehouse,
-        }
-        if tool_context is not None:
-            state = getattr(tool_context, "state", None)
-            if state is not None:
-                state["posthog_dwh_eda"] = result
-        return result
-
-    tables_data = warehouse.get("data") or {}
-    tables = tables_data.get("results") or []
+    tables_data = tables_payload.get("data") or {}
+    tables = tables_data.get("tables") or []
     tables = tables[: max(1, int(max_tables))]
 
     table_summaries = []
@@ -235,29 +208,37 @@ def posthog_dwh_eda(
     join_candidates: List[Dict[str, Any]] = []
 
     for table in tables:
-        name = table.get("name")
-        columns = [c.get("name") for c in (table.get("columns") or []) if c.get("name")]
+        table_id = table.get("table_id") or table.get("name")
+        table_name = table.get("table_name") or table_id
         table_summary: Dict[str, Any] = {
-            "name": name,
-            "format": table.get("format"),
-            "column_count": len(columns),
-            "columns": columns,
+            "table_id": table_id,
+            "name": table_name,
+            "engine": table.get("engine"),
+            "total_rows": table.get("total_rows"),
+            "total_bytes": table.get("total_bytes"),
         }
 
-        if not name:
-            table_summary["sample_status"] = "skipped_missing_name"
+        if not table_id:
+            table_summary["sample_status"] = "skipped_missing_table_id"
             table_summaries.append(table_summary)
             continue
 
-        pick_cols = columns[: max(1, int(sample_columns))] if columns else []
-        select_cols = ", ".join(_quote_ident(col) for col in pick_cols) if pick_cols else "*"
-        hogql = f"SELECT {select_cols} FROM {_quote_ident(name)} LIMIT {int(sample_rows)}"
         try:
-            sample = _posthog_hogql_query(host, token, project_id, hogql)
-            rows = sample.get("rows") or []
-            summary = _summarize_sample(pick_cols or columns, rows)
+            columns_payload = _inspector_list_columns(
+                url, agent_secret, vercel_protection, session_id, str(table_id)
+            )
+            columns_data = columns_payload.get("data") or {}
+            columns_meta_full = columns_data.get("columns") or []
+            columns_meta = columns_meta_full
+            if sample_columns:
+                columns_meta = columns_meta_full[: max(1, int(sample_columns))]
+
+            column_names = _extract_columns_from_meta(columns_meta_full)
+            summary = _summarize_columns_from_examples(columns_meta)
+
             table_summary["sample_status"] = "ok"
-            table_summary["sampled_columns"] = pick_cols or columns
+            table_summary["column_count"] = len(columns_meta_full)
+            table_summary["columns"] = column_names
             table_summary["sample_summary"] = summary
 
             for col, meta in summary.get("columns", {}).items():
@@ -265,7 +246,8 @@ def posthog_dwh_eda(
                 if roles:
                     join_hints.append(
                         {
-                            "table": name,
+                            "table": table_name,
+                            "table_id": table_id,
                             "column": col,
                             "roles": roles,
                             "samples": meta.get("samples", []),
@@ -277,7 +259,6 @@ def posthog_dwh_eda(
 
         table_summaries.append(table_summary)
 
-    # Build explicit join proposals from overlapping sample values
     role_groups = ["email", "domain_or_url", "id", "company_ref", "billing_ref", "user_ref"]
     role_index: Dict[str, List[Dict[str, Any]]] = {role: [] for role in role_groups}
     for hint in join_hints:
@@ -286,6 +267,7 @@ def posthog_dwh_eda(
             continue
         entry = {
             "table": hint.get("table"),
+            "table_id": hint.get("table_id"),
             "column": hint.get("column"),
             "samples": samples,
         }
@@ -314,6 +296,7 @@ def posthog_dwh_eda(
                 join_candidates.append(
                     {
                         "tables": [left["table"], right["table"]],
+                        "table_ids": [left.get("table_id"), right.get("table_id")],
                         "columns": [left["column"], right["column"]],
                         "role": role,
                         "overlap_samples": overlap,
@@ -322,10 +305,8 @@ def posthog_dwh_eda(
 
     result = {
         "status": "ok",
-        "host": host,
-        "project_id": project_id,
-        "projects": projects,
-        "warehouse_tables": tables_data,
+        "inspector_url": url,
+        "tables": tables_data,
         "table_summaries": table_summaries,
         "join_hints": join_hints,
         "join_candidates": join_candidates,
@@ -333,5 +314,5 @@ def posthog_dwh_eda(
     if tool_context is not None:
         state = getattr(tool_context, "state", None)
         if state is not None:
-            state["posthog_dwh_eda"] = result
+            state["inspector_dwh_eda"] = result
     return result
