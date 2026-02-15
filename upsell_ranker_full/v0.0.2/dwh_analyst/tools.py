@@ -13,6 +13,10 @@ def _extract_columns_from_meta(columns_meta: List[Dict[str, Any]]) -> List[str]:
     return columns
 
 
+def _extract_column_samples(column_meta: Dict[str, Any]) -> List[Any]:
+    return column_meta.get("samples") or column_meta.get("examples") or []
+
+
 def _normalize_value(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -76,7 +80,7 @@ def _summarize_columns_from_examples(
         name = col.get("col_name") or col.get("name") or col.get("col_id")
         if not name:
             continue
-        raw_examples = col.get("examples") or []
+        raw_examples = _extract_column_samples(col)
         values = []
         for value in raw_examples:
             norm = _normalize_value(value)
@@ -91,6 +95,7 @@ def _summarize_columns_from_examples(
         if not unique_samples and raw_examples:
             unique_samples = ["<empty>"]
         summary["columns"][str(name)] = {
+            "type": col.get("type"),
             "non_empty": len(values),
             "empty": 0,
             "samples": unique_samples,
@@ -105,7 +110,7 @@ def _inspector_list_tables(
     vercel_protection: str,
     session_id: str,
 ) -> Dict[str, Any]:
-    cache_key = f"inspector_list_tables:v1:session_id={session_id}"
+    cache_key = f"inspector_list_tables:v2:session_id={session_id}"
     cached = cache_read_json(cache_key)
     if isinstance(cached, dict):
         return {"ok": True, "cached": True, "data": cached}
@@ -129,7 +134,7 @@ def _inspector_list_columns(
     session_id: str,
     table_id: str,
 ) -> Dict[str, Any]:
-    cache_key = f"inspector_list_columns:v1:session_id={session_id}:table_id={table_id}"
+    cache_key = f"inspector_list_columns:v2:session_id={session_id}:table_id={table_id}"
     cached = cache_read_json(cache_key)
     if isinstance(cached, dict):
         return {"ok": True, "cached": True, "data": cached}
@@ -208,12 +213,19 @@ def inspector_dwh_eda(
     join_candidates: List[Dict[str, Any]] = []
 
     for table in tables:
-        table_id = table.get("table_id") or table.get("name")
-        table_name = table.get("table_name") or table_id
+        table_id = (
+            table.get("table_id")
+            or table.get("queryable_name")
+            or table.get("table_name")
+            or table.get("name")
+        )
+        table_name = table.get("table_name") or table.get("name") or table_id
         table_summary: Dict[str, Any] = {
             "table_id": table_id,
             "name": table_name,
-            "engine": table.get("engine"),
+            "queryable_name": table.get("queryable_name") or table_id,
+            "source_type": table.get("source_type"),
+            "engine": table.get("engine") or table.get("source_type"),
             "total_rows": table.get("total_rows"),
             "total_bytes": table.get("total_bytes"),
         }
@@ -239,6 +251,19 @@ def inspector_dwh_eda(
             table_summary["sample_status"] = "ok"
             table_summary["column_count"] = len(columns_meta_full)
             table_summary["columns"] = column_names
+            table_summary["column_types"] = {
+                str(
+                    col.get("col_name")
+                    or col.get("name")
+                    or col.get("col_id")
+                ): col.get("type")
+                for col in columns_meta_full
+                if (
+                    col.get("col_name")
+                    or col.get("name")
+                    or col.get("col_id")
+                )
+            }
             table_summary["sample_summary"] = summary
 
             for col, meta in summary.get("columns", {}).items():
