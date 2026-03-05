@@ -159,7 +159,12 @@ Optional runtime tuning:
 ```bash
 export SIGNAL_AGENT_MAX_QUERIES="6"
 export SIGNAL_AGENT_MAX_ROWS="200"
+export SIGNAL_AGENT_MAX_LLM_CALLS="160"
+export SIGNAL_AGENT_MIN_ITERATIONS_BEFORE_EXIT="3"
 ```
+
+Signal agent flow (current): `bootstrap -> scoped discovery loop -> finalize`.
+Loop exits are scoped so parent sequential flow continues to finalization.
 
 Optional per-agent Gemini model overrides:
 
