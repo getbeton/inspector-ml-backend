@@ -1,3 +1,5 @@
+"""Database access and loop-state helpers for Telegram analytics experiments."""
+
 import hashlib
 import json
 import os

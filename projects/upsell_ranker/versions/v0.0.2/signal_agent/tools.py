@@ -1,3 +1,5 @@
+"""Read-only signal discovery helpers with caching, policy checks, and artifacts."""
+
 import json
 import hashlib
 import os

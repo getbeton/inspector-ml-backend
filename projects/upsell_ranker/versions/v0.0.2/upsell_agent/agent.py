@@ -1,3 +1,5 @@
+"""Entry agent for v0.0.2 that turns website context into a working upsell hypothesis."""
+
 import os
 from typing import Any, Dict, List
 

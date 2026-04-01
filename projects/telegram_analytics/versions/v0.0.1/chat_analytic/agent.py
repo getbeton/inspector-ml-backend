@@ -1,3 +1,5 @@
+"""Telegram chat analytics agent with staged discovery and review loops."""
+
 import inspect
 import os
 from typing import Any, Dict

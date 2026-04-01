@@ -1,3 +1,5 @@
+"""Integration-heavy tool surface for the v0.0.1 upsell agent."""
+
 import os
 import asyncio
 from typing import Any, Dict, List, Tuple

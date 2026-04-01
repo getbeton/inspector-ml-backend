@@ -1,3 +1,5 @@
+"""Baseline Attio-only upsell ranking agent."""
+
 import os
 from google.adk.agents.llm_agent import Agent
 from .tools_attio import refresh_attio_dump
