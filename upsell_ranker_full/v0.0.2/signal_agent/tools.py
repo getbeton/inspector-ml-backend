@@ -17,6 +17,7 @@ from .models import (
     ExperimentReport,
     PromotedSignal,
     ReviewDecision,
+    SignalObjective,
     WarehouseProfile,
 )
 
@@ -136,6 +137,8 @@ def _state_from_context(tool_context: Any) -> Dict[str, Any]:
         state.setdefault(key, [])
     state.setdefault("allowed_tables", [])
     state.setdefault("warehouse_profile", {})
+    state.setdefault("signal_objective", {})
+    state.setdefault("latest_event_profile", {})
     state.setdefault("tool_call_cache", {})
     state.setdefault("last_loop_status", {})
     return state
@@ -191,6 +194,11 @@ def _tool_exception(tool_name: str, exc: Exception, state: Optional[Dict[str, An
     return payload
 
 
+def _truncate_rows_for_llm(rows: List[Any]) -> List[Any]:
+    max_rows = _to_int_env("SIGNAL_AGENT_LLM_ROW_RETURN_LIMIT", 12)
+    return list(rows[: max(1, max_rows)])
+
+
 def _session_id_arg(session_id: str, state: Dict[str, Any]) -> str:
     provided = (session_id or "").strip()
     if provided:
@@ -235,6 +243,8 @@ def initialize_signal_run(
         state["allowed_tables"] = []
         state["schema_snapshot"] = {}
         state["warehouse_profile"] = {}
+        state["signal_objective"] = {}
+        state["latest_event_profile"] = {}
         state["query_count"] = 0
         state["failure_count"] = 0
         state["non_query_failure_count"] = 0
@@ -638,6 +648,7 @@ def run_readonly_query(
         state["query_count"] = query_count + 1
         rows = exec_resp.get("results") or []
         types = exec_resp.get("types") or []
+        llm_rows = _truncate_rows_for_llm(rows)
         outcome = ExecutionOutcome(
             status="ok",
             purpose=purpose or "signal_query",
@@ -656,8 +667,9 @@ def run_readonly_query(
             "purpose": purpose,
             "expected_grain": expected_grain,
             "columns": types,
-            "rows": rows,
+            "rows": llm_rows,
             "row_count": len(rows),
+            "returned_row_count": len(llm_rows),
             "cached": bool(exec_resp.get("cached")),
             "policy_version": POLICY_VERSION,
         }
@@ -666,7 +678,9 @@ def run_readonly_query(
 
 
 def sample_rows(table_name: str, session_id: str = "", limit: int = 20, tool_context: Any = None) -> Dict[str, Any]:
-    safe_limit = max(1, min(int(limit), _to_int_env("SIGNAL_AGENT_MAX_ROWS", 500)))
+    default_limit = _to_int_env("SIGNAL_AGENT_SAMPLE_ROWS_LIMIT", 5)
+    requested_limit = int(limit) if int(limit) > 0 else default_limit
+    safe_limit = max(1, min(requested_limit, _to_int_env("SIGNAL_AGENT_MAX_ROWS", 500)))
     sql = f"SELECT * FROM {table_name.strip()} LIMIT {safe_limit}"
     return run_readonly_query(
         sql=sql,
@@ -677,6 +691,190 @@ def sample_rows(table_name: str, session_id: str = "", limit: int = 20, tool_con
     )
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_row_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    if isinstance(row, list) and 0 <= index < len(row):
+        return row[index]
+    return None
+
+
+def _extract_event_profile(rows: List[Any], event_col_name: str) -> List[Dict[str, Any]]:
+    event_totals: Dict[str, Dict[str, Any]] = {}
+    normalized_col = (event_col_name or "").strip() or "event_name"
+    for row in rows:
+        raw_event = _extract_row_value(row, "event_name", 1)
+        if raw_event is None:
+            raw_event = _extract_row_value(row, normalized_col, 1)
+        event_name = str(raw_event or "").strip()
+        if not event_name:
+            continue
+        event_count = _coerce_int(_extract_row_value(row, "event_count", 2), 0)
+        distinct_hint = _coerce_int(_extract_row_value(row, "distinct_distinct_id", 3), 0)
+        bucket = event_totals.setdefault(
+            event_name,
+            {"event_name": event_name, "event_count": 0, "distinct_users_hint": 0},
+        )
+        bucket["event_count"] = int(bucket["event_count"]) + event_count
+        bucket["distinct_users_hint"] = int(bucket["distinct_users_hint"]) + distinct_hint
+    return sorted(event_totals.values(), key=lambda x: int(x.get("event_count") or 0), reverse=True)[:40]
+
+
+def _event_name_lexical_score(event_name: str, success_event_hint: str) -> float:
+    lower = (event_name or "").strip().lower()
+    if not lower:
+        return 0.0
+    hint = (success_event_hint or "").strip().lower() or "user_signup"
+    if lower == hint:
+        return 1.0
+    if hint in lower:
+        return 0.95
+    keyword_weights = (
+        ("user_signup", 0.95),
+        ("signup", 0.9),
+        ("sign_up", 0.9),
+        ("sign-up", 0.9),
+        ("register", 0.85),
+        ("subscription", 0.8),
+        ("subscribe", 0.8),
+        ("upgrade", 0.75),
+        ("purchase", 0.7),
+        ("checkout", 0.7),
+        ("billing", 0.55),
+    )
+    for keyword, score in keyword_weights:
+        if keyword in lower:
+            return score
+    return 0.0
+
+
+def _infer_success_event_from_profile(
+    event_profile: List[Dict[str, Any]], success_event_hint: str
+) -> Tuple[str, float, bool, List[Dict[str, Any]]]:
+    if not event_profile:
+        fallback = (success_event_hint or "").strip() or "user_signup"
+        return fallback, 0.25, True, []
+    total_events = max(1, sum(_coerce_int(item.get("event_count"), 0) for item in event_profile))
+    scored: List[Dict[str, Any]] = []
+    for item in event_profile:
+        event_name = str(item.get("event_name") or "").strip()
+        if not event_name:
+            continue
+        lexical_score = _event_name_lexical_score(event_name, success_event_hint)
+        volume_share = min(0.2, _coerce_float(item.get("event_count"), 0.0) / total_events)
+        score = lexical_score + volume_share
+        scored.append(
+            {
+                "event_name": event_name,
+                "event_count": _coerce_int(item.get("event_count"), 0),
+                "distinct_users_hint": _coerce_int(item.get("distinct_users_hint"), 0),
+                "lexical_score": round(lexical_score, 4),
+                "score": round(score, 4),
+            }
+        )
+    scored.sort(key=lambda x: _coerce_float(x.get("score"), 0.0), reverse=True)
+    best = scored[0] if scored else {}
+    best_name = str(best.get("event_name") or "").strip()
+    best_score = _coerce_float(best.get("score"), 0.0)
+    if best_name and best_score >= 0.7:
+        confidence = min(0.99, max(0.55, best_score))
+        return best_name, confidence, False, scored[:8]
+    fallback = (success_event_hint or "").strip() or "user_signup"
+    fallback_bonus = 0.15 if any(str(x.get("event_name") or "").strip().lower() == fallback.lower() for x in scored) else 0.0
+    return fallback, min(0.75, 0.35 + fallback_bonus), True, scored[:8]
+
+
+def _build_cohort_sql_snippets(
+    events_table: str,
+    person_col: str,
+    time_col: str,
+    event_col: str,
+    session_col: str,
+    success_event_name: str,
+    failure_inactivity_days: int,
+) -> Dict[str, str]:
+    table = events_table.strip() or "events"
+    pid = person_col.strip() or "distinct_id"
+    ts = time_col.strip() or "timestamp"
+    ev = event_col.strip() or "event"
+    sess = session_col.strip() or "$session_id"
+    success_value = success_event_name.replace("'", "\\'")
+    inactive_days = max(1, int(failure_inactivity_days))
+    return {
+        "success_users_30d": (
+            f"SELECT DISTINCT {pid} AS person_id "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"AND {ts} >= now() - INTERVAL 30 DAY"
+        ),
+        "failure_users_inactive_gt_days": (
+            f"SELECT {pid} AS person_id "
+            f"FROM {table} "
+            f"GROUP BY {pid} "
+            f"HAVING max({ts}) < now() - INTERVAL {inactive_days} DAY "
+            f"AND {pid} NOT IN ("
+            f"SELECT DISTINCT {pid} FROM {table} WHERE {ev} = '{success_value}'"
+            f")"
+        ),
+        "grey_users_active_non_success_30d": (
+            f"SELECT DISTINCT {pid} AS person_id "
+            f"FROM {table} "
+            f"WHERE {ts} >= now() - INTERVAL 30 DAY "
+            f"AND {pid} NOT IN ("
+            f"SELECT DISTINCT {pid} FROM {table} WHERE {ev} = '{success_value}'"
+            f") "
+            f"AND {pid} NOT IN ("
+            f"SELECT {pid} FROM {table} GROUP BY {pid} "
+            f"HAVING max({ts}) < now() - INTERVAL {inactive_days} DAY"
+            f")"
+        ),
+        "precursor_path_same_session": (
+            f"WITH success AS ("
+            f"SELECT {pid} AS person_id, {sess} AS session_id, min({ts}) AS success_ts "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"GROUP BY {pid}, {sess}"
+            f") "
+            f"SELECT e.{ev} AS precursor_event, countDistinct(e.{pid}) AS users "
+            f"FROM {table} e "
+            f"INNER JOIN success s ON e.{pid} = s.person_id AND e.{sess} = s.session_id "
+            f"WHERE e.{ts} < s.success_ts "
+            f"AND e.{ts} >= s.success_ts - INTERVAL 1 DAY "
+            f"GROUP BY precursor_event "
+            f"ORDER BY users DESC LIMIT 50"
+        ),
+        "precursor_path_7d": (
+            f"WITH success AS ("
+            f"SELECT {pid} AS person_id, min({ts}) AS success_ts "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"GROUP BY {pid}"
+            f") "
+            f"SELECT e.{ev} AS precursor_event, countDistinct(e.{pid}) AS users "
+            f"FROM {table} e "
+            f"INNER JOIN success s ON e.{pid} = s.person_id "
+            f"WHERE e.{ts} < s.success_ts "
+            f"AND e.{ts} >= s.success_ts - INTERVAL 7 DAY "
+            f"GROUP BY precursor_event "
+            f"ORDER BY users DESC LIMIT 50"
+        ),
+    }
+
+
 def profile_events(
     table_name: str,
     time_col: str,
@@ -685,8 +883,11 @@ def profile_events(
     session_id: str = "",
     tool_context: Any = None,
 ) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
     keys = [key.strip() for key in (distinct_keys or []) if key and key.strip()]
+    keys = keys[: max(1, _to_int_env("SIGNAL_AGENT_PROFILE_DISTINCT_KEY_LIMIT", 3))]
     distinct_fragments = [f"COUNT(DISTINCT {key}) AS distinct_{key}" for key in keys[:6]]
+    profile_limit = max(10, _to_int_env("SIGNAL_AGENT_PROFILE_EVENTS_LIMIT", 60))
     metrics_sql = ",\n       ".join(["COUNT(*) AS event_count"] + distinct_fragments)
     sql = (
         f"SELECT dateTrunc('day', {time_col}) AS event_day,\n"
@@ -695,15 +896,125 @@ def profile_events(
         f"FROM {table_name}\n"
         f"GROUP BY event_day, event_name\n"
         f"ORDER BY event_day DESC, event_count DESC\n"
-        f"LIMIT 200"
+        f"LIMIT {profile_limit}"
     )
-    return run_readonly_query(
+    result = run_readonly_query(
         sql=sql,
         purpose=f"profile_events:{table_name}",
         expected_grain="event_day_event_name",
         session_id=session_id,
         tool_context=tool_context,
     )
+    if not result.get("ok"):
+        return result
+    rows = result.get("rows") or []
+    event_profile = _extract_event_profile(rows, event_col)
+    snapshot = {
+        "captured_at": _utc_now(),
+        "table_name": table_name,
+        "time_col": time_col,
+        "event_col": event_col,
+        "distinct_keys": keys,
+        "top_events": event_profile,
+    }
+    state["latest_event_profile"] = snapshot
+    _record_artifact(state, "event_profile_snapshot", snapshot, append=False)
+    return {**result, "top_events": event_profile[:12]}
+
+
+def infer_signal_objective(
+    success_event_hint: str = "user_signup",
+    failure_inactivity_days: int = 7,
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    profile = state.get("warehouse_profile") or {}
+    events_meta = profile.get("events_table") if isinstance(profile.get("events_table"), dict) else {}
+    latest_profile = state.get("latest_event_profile") or {}
+    events_table = (
+        str(profile.get("primary_events_table") or "")
+        or str(events_meta.get("table_name") or "")
+        or str(latest_profile.get("table_name") or "")
+        or "events"
+    )
+    time_col = (
+        str(profile.get("inferred_time_column") or "")
+        or str(events_meta.get("time_column") or "")
+        or str(latest_profile.get("time_col") or "")
+        or "timestamp"
+    )
+    event_col = (
+        str(profile.get("inferred_event_column") or "")
+        or str(events_meta.get("event_column") or "")
+        or str(latest_profile.get("event_col") or "")
+        or "event"
+    )
+    person_col = (
+        str(profile.get("inferred_distinct_id_column") or "")
+        or str(events_meta.get("person_column") or "")
+        or "distinct_id"
+    )
+    session_col = (
+        str(profile.get("inferred_session_column") or "")
+        or str(events_meta.get("session_column") or "")
+        or "$session_id"
+    )
+    top_events = latest_profile.get("top_events") if isinstance(latest_profile.get("top_events"), list) else []
+    success_event, confidence, fallback_used, candidates = _infer_success_event_from_profile(
+        event_profile=top_events,
+        success_event_hint=success_event_hint,
+    )
+    payload = {
+        "success_event_name": success_event,
+        "success_event_confidence": round(confidence, 4),
+        "success_fallback_used": bool(fallback_used),
+        "success_event_candidates": candidates,
+        "failure_inactivity_days": max(1, int(failure_inactivity_days)),
+        "success_overrides_failure": True,
+        "events_table": events_table,
+        "events_time_column": time_col,
+        "events_event_column": event_col,
+        "events_person_column": person_col,
+        "events_session_column": session_col,
+        "objective_notes": [
+            "Success target inferred from profiled events with lexical+volume scoring.",
+            "Failure cohort is inactivity > failure_inactivity_days and excludes any success user.",
+        ],
+        "cohort_sql_snippets": _build_cohort_sql_snippets(
+            events_table=events_table,
+            person_col=person_col,
+            time_col=time_col,
+            event_col=event_col,
+            session_col=session_col,
+            success_event_name=success_event,
+            failure_inactivity_days=max(1, int(failure_inactivity_days)),
+        ),
+        "captured_at": _utc_now(),
+    }
+    ok, validated = _safe_model_validate(SignalObjective, payload)
+    if not ok:
+        state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+        return validated
+    state["signal_objective"] = validated
+    _record_artifact(state, "signal_objective", validated, append=False)
+    return {"ok": True, "signal_objective": validated}
+
+
+def get_signal_objective(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    objective = state.get("signal_objective")
+    if isinstance(objective, dict) and objective.get("success_event_name"):
+        return {"ok": True, "signal_objective": objective}
+    inferred = infer_signal_objective(tool_context=tool_context)
+    if not inferred.get("ok"):
+        return inferred
+    return {"ok": True, "signal_objective": inferred.get("signal_objective", {})}
+
+
+def get_warehouse_profile(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    profile = state.get("warehouse_profile") or {}
+    return {"ok": True, "warehouse_profile": profile}
 
 
 def _safe_model_validate(model_cls: Any, payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -712,6 +1023,77 @@ def _safe_model_validate(model_cls: Any, payload: Dict[str, Any]) -> Tuple[bool,
     except ValidationError as exc:
         return False, {"ok": False, "error": "validation_error", "detail": str(exc)}
     return True, validated.model_dump()
+
+
+def _normalize_review_decision(review_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(review_payload or {})
+    decision_raw = str(payload.get("decision") or payload.get("status") or "").strip().lower()
+    promoted_flag = bool(payload.get("promoted"))
+    approve_tokens = {"approve", "approved", "promote", "promoted", "accept", "accepted", "pass", "passed"}
+    decision = "approve" if (decision_raw in approve_tokens or promoted_flag) else "reject"
+
+    reasons_raw = payload.get("reasons")
+    reasons: List[str] = []
+    if isinstance(reasons_raw, list):
+        reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+    elif isinstance(payload.get("reason"), str) and payload.get("reason", "").strip():
+        reasons = [str(payload.get("reason")).strip()]
+
+    required_fixes_raw = payload.get("required_fixes")
+    required_fixes: List[str] = []
+    if isinstance(required_fixes_raw, list):
+        required_fixes = [str(item).strip() for item in required_fixes_raw if str(item).strip()]
+    elif isinstance(payload.get("required_fix"), str) and payload.get("required_fix", "").strip():
+        required_fixes = [str(payload.get("required_fix")).strip()]
+
+    promotion_readiness = bool(payload.get("promotion_readiness")) or decision == "approve"
+    normalized = {
+        "decision": decision,
+        "reasons": reasons,
+        "required_fixes": required_fixes,
+        "promotion_readiness": promotion_readiness,
+    }
+    if isinstance(payload.get("status"), str):
+        normalized["status"] = payload.get("status")
+    if isinstance(payload.get("reason"), str):
+        normalized["reason"] = payload.get("reason")
+    normalized["promoted"] = promoted_flag
+    return normalized
+
+
+def _candidate_mentions_success_target(payload: Dict[str, Any], objective: Dict[str, Any]) -> bool:
+    target = str(objective.get("success_event_name") or "").strip().lower()
+    if not target:
+        return True
+    direct_target = str(payload.get("target_event") or "").strip().lower()
+    if direct_target == target:
+        return True
+    corpus = " ".join(
+        [
+            str(payload.get("name") or ""),
+            str(payload.get("interpretation") or ""),
+            str(payload.get("query_template") or ""),
+            str(payload.get("entity_grain") or ""),
+        ]
+    ).lower()
+    return target in corpus
+
+
+def _candidate_has_cohort_evidence(payload: Dict[str, Any]) -> bool:
+    evidence = payload.get("promotion_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    required_markers = {
+        "success_cohort_size",
+        "failure_cohort_size",
+        "grey_cohort_size",
+        "conversion_lift",
+        "conversion_rate_delta",
+        "precision_proxy",
+    }
+    if any(marker in evidence for marker in required_markers):
+        return True
+    return bool(evidence.get("cohort_metrics"))
 
 
 def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
@@ -723,7 +1105,38 @@ def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) 
         if cached is not None:
             return cached
         payload.setdefault("stored_at", _utc_now())
-        is_promoted = bool(payload.get("promoted")) or str(payload.get("status") or "").lower() == "promoted"
+        requested_promoted = bool(payload.get("promoted")) or str(payload.get("status") or "").lower() == "promoted"
+        review_payload = payload.get("review_decision")
+        review_validated: Optional[Dict[str, Any]] = None
+        if isinstance(review_payload, dict):
+            normalized_review = _normalize_review_decision(review_payload)
+            review_ok, review_candidate = _safe_model_validate(ReviewDecision, normalized_review)
+            if review_ok:
+                review_validated = review_candidate
+                payload["review_decision"] = normalized_review
+            else:
+                payload["review_decision"] = normalized_review
+
+        review_allows_promotion = bool(
+            review_validated
+            and str(review_validated.get("decision") or "").strip().lower() == "approve"
+            and bool(review_validated.get("promotion_readiness"))
+        )
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        conversion_aligned = _candidate_mentions_success_target(payload, objective)
+        has_cohort_evidence = _candidate_has_cohort_evidence(payload)
+        promotion_block_reason = ""
+        if requested_promoted and not review_allows_promotion:
+            promotion_block_reason = "promotion_requires_approved_review_decision"
+        elif requested_promoted and not conversion_aligned:
+            promotion_block_reason = "candidate_missing_success_target_alignment"
+        elif requested_promoted and not has_cohort_evidence:
+            promotion_block_reason = "candidate_missing_cohort_evidence"
+        is_promoted = requested_promoted and not promotion_block_reason
+        if promotion_block_reason:
+            payload["promoted"] = False
+            payload["status"] = "candidate"
+            payload["promotion_block_reason"] = promotion_block_reason
         model_cls = PromotedSignal if is_promoted else CandidateSignalDraft
         ok, validated = _safe_model_validate(model_cls, payload)
         if not ok:
@@ -733,12 +1146,9 @@ def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) 
         state.setdefault("candidate_hypotheses", []).append(validated)
         _record_artifact(state, "candidate_hypotheses", validated, append=True)
 
-        review_payload = payload.get("review_decision")
-        if isinstance(review_payload, dict):
-            review_ok, review_validated = _safe_model_validate(ReviewDecision, review_payload)
-            if review_ok:
-                state.setdefault("review_decisions", []).append(review_validated)
-                _record_artifact(state, "review_decisions", review_validated, append=True)
+        if review_validated:
+            state.setdefault("review_decisions", []).append(review_validated)
+            _record_artifact(state, "review_decisions", review_validated, append=True)
 
         execution_payload = payload.get("execution_outcome")
         if isinstance(execution_payload, dict):
@@ -758,6 +1168,9 @@ def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) 
             _tool_cache_set(state, "store_candidate_signal", args_payload, result)
             return result
         result = {"ok": True, "stored_as": "candidate_hypothesis", "name": validated.get("name")}
+        if promotion_block_reason:
+            result["promotion_blocked"] = True
+            result["promotion_block_reason"] = promotion_block_reason
         _tool_cache_set(state, "store_candidate_signal", args_payload, result)
         return result
     except Exception as exc:
@@ -841,6 +1254,18 @@ def store_warehouse_profile(profile: Dict[str, Any], tool_context: Any = None) -
                 prop_cols = likely.get("properties")
                 if isinstance(prop_cols, list) and prop_cols:
                     payload["inferred_properties_column"] = str(prop_cols[0])
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        if objective:
+            if not payload.get("success_event_name"):
+                payload["success_event_name"] = str(objective.get("success_event_name") or "")
+            if payload.get("success_event_confidence") in (None, ""):
+                payload["success_event_confidence"] = _coerce_float(objective.get("success_event_confidence"), 0.0)
+            if payload.get("success_fallback_used") in (None, ""):
+                payload["success_fallback_used"] = bool(objective.get("success_fallback_used"))
+            if payload.get("failure_inactivity_days") in (None, ""):
+                payload["failure_inactivity_days"] = _coerce_int(objective.get("failure_inactivity_days"), 7)
+            if payload.get("success_overrides_failure") in (None, ""):
+                payload["success_overrides_failure"] = bool(objective.get("success_overrides_failure", True))
         ok, validated = _safe_model_validate(WarehouseProfile, payload)
         if not ok:
             return validated
@@ -877,21 +1302,45 @@ def _shift_param_dates(param_set: Dict[str, Any], shift_days: int) -> Dict[str, 
     for key, value in list(shifted.items()):
         if not isinstance(value, str):
             continue
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        dt: Optional[datetime] = None
+        out_format = ""
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                out_format = "%Y-%m-%d"
+            except Exception:
+                dt = None
+        elif re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", value):
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                out_format = "%Y-%m-%d %H:%M:%S"
+            except Exception:
+                dt = None
+        if dt is None:
             continue
-        try:
-            dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        shifted[key] = (dt + timedelta(days=shift_days)).strftime("%Y-%m-%d")
+        shifted[key] = (dt + timedelta(days=shift_days)).strftime(out_format)
     return shifted
 
 
 def _render_template(template: str, params: Dict[str, Any]) -> str:
     rendered = str(template or "")
     for key, value in (params or {}).items():
-        rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+        replacement = str(value)
+        rendered = rendered.replace(f"{{{{{key}}}}}", replacement)
+        rendered = rendered.replace(f"{{{key}}}", replacement)
+        rendered = rendered.replace(f"%({key})s", replacement)
     return rendered
+
+
+def _find_unresolved_template_tokens(sql: str) -> List[str]:
+    unresolved: List[str] = []
+    for match in re.findall(r"%\(([a-zA-Z_][a-zA-Z0-9_]*)\)s", sql or ""):
+        unresolved.append(match)
+    for match in re.findall(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}", sql or ""):
+        unresolved.append(match)
+    for match in re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", sql or ""):
+        unresolved.append(match)
+    return sorted(set(unresolved))
 
 
 def rerun_promoted_signals(holdout_shift_days: int = 14, tool_context: Any = None) -> Dict[str, Any]:
@@ -909,6 +1358,20 @@ def rerun_promoted_signals(holdout_shift_days: int = 14, tool_context: Any = Non
         parameter_set = signal.get("parameter_set") or {}
         shifted = _shift_param_dates(parameter_set, int(holdout_shift_days))
         sql = _render_template(query_template, shifted)
+        unresolved_tokens = _find_unresolved_template_tokens(sql)
+        if unresolved_tokens:
+            rerun_entry = {
+                "name": signal.get("name"),
+                "shift_days": int(holdout_shift_days),
+                "params": shifted,
+                "ok": False,
+                "row_count": 0,
+                "error": "unresolved_template_parameters",
+                "unresolved_tokens": unresolved_tokens,
+            }
+            reruns.append(rerun_entry)
+            _record_artifact(state, "holdout_rerun_results", rerun_entry, append=True)
+            continue
         result = run_readonly_query(
             sql=sql,
             purpose=f"holdout_rerun:{signal.get('name') or 'signal'}",
@@ -1054,6 +1517,13 @@ def finalize_experiment_report(holdout_shift_days: int = 14, tool_context: Any =
         rerun_results = state.get("holdout_rerun_results") or []
         loop_events = state.get("loop_iteration_events") or []
         last_loop_status = state.get("last_loop_status") or {}
+        loop_iterations_observed = max(len(loop_events), len(candidates))
+        fallback_stop_iteration = loop_iterations_observed
+        fallback_stop_reason = "loop_exhausted_max_iterations" if loop_iterations_observed else "loop_not_started"
+        llm_calls_used_estimate = int(state.get("llm_calls_used_estimate") or 0)
+        if llm_calls_used_estimate <= 0 and loop_iterations_observed:
+            # Each iteration runs explorer + reviewer, plus bootstrap/finalize overhead.
+            llm_calls_used_estimate = (loop_iterations_observed * 2) + 2
 
         policy_blocked = sum(1 for x in policy_validations if isinstance(x, dict) and not x.get("allowed"))
         reviewer_rejected = sum(
@@ -1091,11 +1561,11 @@ def finalize_experiment_report(holdout_shift_days: int = 14, tool_context: Any =
         report_payload["warehouse_profile"] = state.get("warehouse_profile") or {}
         report_payload["promoted_signals"] = promoted
         report_payload["holdout_rerun_results"] = rerun_results
-        report_payload["stop_reason"] = str(last_loop_status.get("reason") or "")
-        report_payload["stop_iteration"] = int(last_loop_status.get("iteration_index") or 0)
-        report_payload["loop_iterations_observed"] = len(loop_events)
+        report_payload["stop_reason"] = str(last_loop_status.get("reason") or fallback_stop_reason)
+        report_payload["stop_iteration"] = int(last_loop_status.get("iteration_index") or fallback_stop_iteration)
+        report_payload["loop_iterations_observed"] = loop_iterations_observed
         report_payload["query_count_total"] = int(state.get("query_count") or 0)
-        report_payload["llm_calls_used_estimate"] = int(state.get("llm_calls_used_estimate") or 0)
+        report_payload["llm_calls_used_estimate"] = llm_calls_used_estimate
         state["experiment_report"] = report_payload
         _record_artifact(state, "experiment_report", report_payload, append=False)
 
