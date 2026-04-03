@@ -1,13 +1,13 @@
 # Agent Systems Workspace
 
-Experimental workspace for agentic analytics systems focused on signal discovery, warehouse reasoning, and evidence-backed analysis workflows.
+ML/backend workspace for Beton's agentic analytics systems. This repo contains the backend agent logic that powers Beton product experiences around signal discovery, warehouse reasoning, and evidence-backed analysis workflows.
 
 ```mermaid
 flowchart LR
     UserPrompt[User prompt] --> ProjectSelect{Project}
     ProjectSelect --> Upsell[Upsell Ranker]
     ProjectSelect --> Telegram[Telegram Analytics]
-    Upsell --> UpsellFlow[Website or account context -> Inspector-backed warehouse analysis -> signal search]
+    Upsell --> UpsellFlow[Website or account context -> Beton Inspector-backed warehouse analysis -> signal search]
     Telegram --> TelegramFlow[Chat target -> schema bootstrap -> SQL-backed insight loop]
     UpsellFlow --> Outputs[Reports, signals, ranked opportunities]
     TelegramFlow --> Outputs
@@ -15,6 +15,19 @@ flowchart LR
 ```
 
 The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as PostHog, Attio, and similar integrations is planned but not implemented yet.
+
+## Product Context
+
+This repository is the `inspector-ml-backend` for Beton. It is not the full product surface by itself.
+
+- Product website: `https://getbeton.ai`
+- Demo stand / product-facing repo: `https://github.com/getbeton/inspector/tree/staging`
+
+Use those references to understand the product this backend connects to:
+
+- `getbeton.ai` is the public product entry point for Beton.
+- The `getbeton/inspector` staging branch is the demo stand and product-facing layer that sits in front of this ML/backend repo.
+- This repository provides the agent workflows and warehouse-analysis backend that the Beton product layer can call into.
 
 ## Projects
 
@@ -118,7 +131,7 @@ TELEGRAM_DB_PASSWORD=
 ## Open-Source Notes
 
 - This repository is licensed under AGPLv3. See `LICENSE`.
-- Beton Inspector is currently the security-focused deployment path for protected warehouse access in the newest agent versions.
+- Beton Inspector is currently the security-focused product path for protected warehouse access in the newest agent versions.
 - Direct standalone integration flags for systems such as PostHog and Attio are planned.
 - Recent experiments show that explicitly defining the target metric for an agent is the strongest lever on analysis quality.
 
