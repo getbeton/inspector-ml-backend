@@ -1,12 +1,26 @@
 # Agent Systems Workspace
 
-Small research workspace for agentic analytics systems.
+Experimental workspace for agentic analytics systems focused on signal discovery, warehouse reasoning, and evidence-backed analysis workflows.
+
+```mermaid
+flowchart LR
+    UserPrompt[User prompt] --> ProjectSelect{Project}
+    ProjectSelect --> Upsell[Upsell Ranker]
+    ProjectSelect --> Telegram[Telegram Analytics]
+    Upsell --> UpsellFlow[Website or account context -> Inspector-backed warehouse analysis -> signal search]
+    Telegram --> TelegramFlow[Chat target -> schema bootstrap -> SQL-backed insight loop]
+    UpsellFlow --> Outputs[Reports, signals, ranked opportunities]
+    TelegramFlow --> Outputs
+    Scripts[Optional local scripts] -. probes .-> Outputs
+```
+
+The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as PostHog, Attio, and similar integrations is planned but not implemented yet.
 
 ## Projects
 
 - `projects/upsell_ranker` contains the upsell opportunity lineage.
 - `projects/telegram_analytics` contains the Telegram chat analytics lineage.
-- `scripts/` contains small local utilities that are useful across experiments but are not part of the runtime agents.
+- `scripts/` contains optional local utilities for one-off probing rather than the main agent runtime.
 
 ## Repository Layout
 
@@ -23,8 +37,6 @@ projects/
 scripts/
 ```
 
-Each project keeps versions side by side to make architectural changes explicit.
-
 ## Setup
 
 ```bash
@@ -34,31 +46,38 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill `.env` with the variables you need for the version you want to run. Most values are optional unless that version uses the corresponding integration.
+Fill `.env` with only the variables needed for the version you want to run. `.env.example` contains placeholders only and should not be treated as working credentials.
 
-## Run Upsell Ranker
+## How To Test
 
-Current default version:
+Use `adk web` as the primary local workflow. It starts the ADK server with a web UI, which is the intended path for interactive testing, prompt iteration, and debugging.
+
+Upsell ranker:
 
 ```bash
-adk api_server --host 0.0.0.0 --port 8000 /home/scarlet/upsale-agent/projects/upsell_ranker/versions/v0.0.2
+adk web /home/user/upsale-agent/projects/upsell_ranker/versions/v0.0.2
+```
+
+Telegram analytics:
+
+```bash
+adk web /home/user/upsale-agent/projects/telegram_analytics/versions/v0.0.1
+```
+
+Keep `adk api_server` for production-style or external API integration scenarios:
+
+```bash
+adk api_server --host 0.0.0.0 --port 8000 /home/user/upsale-agent/projects/upsell_ranker/versions/v0.0.2
+adk api_server --host 0.0.0.0 --port 8000 /home/user/upsale-agent/projects/telegram_analytics/versions/v0.0.1
 ```
 
 Legacy baseline smoke check:
 
 ```bash
-python -c "import sys; sys.path.append('/home/scarlet/upsale-agent/projects/upsell_ranker/versions/v0.0.0'); from scoring import rank_accounts; print(rank_accounts(top_n=5))"
-```
-
-## Run Telegram Analytics
-
-```bash
-adk api_server --host 0.0.0.0 --port 8000 /home/scarlet/upsale-agent/projects/telegram_analytics/versions/v0.0.1
+python -c "import sys; sys.path.append('/home/user/upsale-agent/projects/upsell_ranker/versions/v0.0.0'); from scoring import rank_accounts; print(rank_accounts(top_n=5))"
 ```
 
 ## Environment
-
-Copy `.env.example` and keep only the values relevant to your run.
 
 Core variables used in the repo:
 
@@ -96,7 +115,15 @@ TELEGRAM_DB_USER=
 TELEGRAM_DB_PASSWORD=
 ```
 
+## Open-Source Notes
+
+- This repository is licensed under AGPLv3. See `LICENSE`.
+- Beton Inspector is currently the security-focused deployment path for protected warehouse access in the newest agent versions.
+- Direct standalone integration flags for systems such as PostHog and Attio are planned.
+- Recent experiments show that explicitly defining the target metric for an agent is the strongest lever on analysis quality.
+
 ## Notes
 
 - Generated artifacts, caches, logs, and local report outputs are intentionally ignored.
-- Version-specific details live in each version README.
+- Version-specific details live in each project and version README.
+- Public docs use "warehouse" in place of internal shorthand such as "DWH" on first mention.

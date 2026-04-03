@@ -11,9 +11,9 @@
 ## Build, Test, and Development Commands
 - `python -m venv .venv && source .venv/bin/activate` creates and activates a local Python env.
 - `pip install -r requirements.txt` installs dependencies for ADK tooling and local analysis scripts.
-- `adk api_server --host 0.0.0.0 --port 8000 /home/scarlet/upsale-agent/projects/upsell_ranker/versions/v0.0.2` starts the current default upsell agent.
-- `adk api_server --host 0.0.0.0 --port 8000 /home/scarlet/upsale-agent/projects/telegram_analytics/versions/v0.0.1` starts the Telegram analytics agent.
-- `python -c "import sys; sys.path.append('/home/scarlet/upsale-agent/projects/upsell_ranker/versions/v0.0.0'); from scoring import rank_accounts; print(rank_accounts(top_n=5))"` performs a quick baseline scoring check.
+- `adk api_server --host 0.0.0.0 --port 8000 /home/user/upsale-agent/projects/upsell_ranker/versions/v0.0.2` starts the current default upsell agent.
+- `adk api_server --host 0.0.0.0 --port 8000 /home/user/upsale-agent/projects/telegram_analytics/versions/v0.0.1` starts the Telegram analytics agent.
+- `python -c "import sys; sys.path.append('/home/user/upsale-agent/projects/upsell_ranker/versions/v0.0.0'); from scoring import rank_accounts; print(rank_accounts(top_n=5))"` performs a quick baseline scoring check.
 
 ## Coding Style & Naming Conventions
 - Python, 4-space indentation, `snake_case` for functions and variables, `PascalCase` for classes.
