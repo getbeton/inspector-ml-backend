@@ -109,7 +109,14 @@ class ScopedLoopAgent(LoopAgent):
             if should_exit:
                 break
             author = getattr(event, "author", "") or getattr(getattr(event, "invocation_metadata", None), "agent", "")
-            if author == "signal_iteration_pipeline" and ctx is not None and self._should_exit_from_state(ctx):
+            # SequentialAgent never emits events with its own author name —
+            # only leaf LlmAgents do.  Check for the reviewer (last sub-agent
+            # in signal_iteration_pipeline) to detect iteration boundaries.
+            is_iteration_end = author == "signal_reviewer_agent" and not any(
+                getattr(p, "function_call", None) is not None
+                for p in getattr(getattr(event, "content", None), "parts", [])
+            )
+            if is_iteration_end and ctx is not None and self._should_exit_from_state(ctx):
                 break
 
 
@@ -288,6 +295,23 @@ explorer_agent = LlmAgent(
         "Candidate fields must include:\n"
         "name, entity_grain, time_window, comparison_baseline, query_template,\n"
         "parameter_set, interpretation, promotion_evidence, target_event, status.\n"
+        "\n"
+        "CRITICAL — promotion_evidence format (required for promotion to succeed):\n"
+        "promotion_evidence must be a dict with numeric cohort metrics from your query.\n"
+        "Include AT LEAST these keys: success_cohort_size, failure_cohort_size,\n"
+        "grey_cohort_size, conversion_lift, conversion_rate_delta, precision_proxy.\n"
+        "Example:\n"
+        "  \"promotion_evidence\": {\n"
+        "    \"success_cohort_size\": 41,\n"
+        "    \"failure_cohort_size\": 2795,\n"
+        "    \"grey_cohort_size\": 120,\n"
+        "    \"conversion_lift\": 2.87,\n"
+        "    \"conversion_rate_delta\": 0.065,\n"
+        "    \"precision_proxy\": 0.098\n"
+        "  }\n"
+        "\n"
+        "CRITICAL — target_event must EXACTLY match the success_event_name from\n"
+        "get_signal_objective (e.g. 'user_signup'). Case-sensitive exact match.\n"
         "Return JSON only.\n"
     ),
 )
@@ -322,8 +346,12 @@ reviewer_agent = LlmAgent(
         "2) Build ReviewDecision JSON with decision=approve|reject and promotion_readiness boolean.\n"
         "3) Call store_candidate_signal once with candidate + review_decision.\n"
         "4) Set promoted=true,status=promoted only when candidate is reusable and execution evidence is meaningful.\n"
-        "5) Do not attempt to terminate the loop; only review the current candidate.\n"
-        "6) Return concise JSON decision only.\n"
+        "5) When promoting, PRESERVE the explorer's promotion_evidence dict (must contain\n"
+        "   success_cohort_size, failure_cohort_size, grey_cohort_size, conversion_lift,\n"
+        "   conversion_rate_delta, precision_proxy). Also set target_event to exactly match\n"
+        "   the success_event_name from get_signal_objective.\n"
+        "6) Do not attempt to terminate the loop; only review the current candidate.\n"
+        "7) Return concise JSON decision only.\n"
     ),
 )
 
