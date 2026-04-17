@@ -285,12 +285,25 @@ def emit_dwh_analytics(payload: Dict[str, Any], tool_context: Any = None) -> Dic
 
 
 def _sanitize_history_for_anthropic(callback_context, llm_request):
-    """Strip orphaned tool_use/tool_result pairs from prior agents in the SequentialAgent history.
+    """Strip orphaned tool_use/tool_result pairs from PRIOR agents only.
+    Keeps the current agent's own tool calls intact so it can see its own results.
     Anthropic requires strict tool_use→tool_result pairing; cross-agent history breaks this."""
     if not hasattr(llm_request, 'contents') or not llm_request.contents:
         return None
+    # Find where the current agent's messages start — the last user message
+    # marks the boundary between prior agent history and current agent turns.
+    last_user_idx = -1
+    for i, content in enumerate(llm_request.contents):
+        role = getattr(content, 'role', '')
+        if role == 'user':
+            last_user_idx = i
+    # Strip function messages only BEFORE the last user message (prior agent history).
+    # Keep everything from the last user message onward (current agent's own turns).
     cleaned = []
-    for content in llm_request.contents:
+    for i, content in enumerate(llm_request.contents):
+        if i > last_user_idx:
+            cleaned.append(content)
+            continue
         parts = getattr(content, 'parts', None)
         if not parts:
             cleaned.append(content)

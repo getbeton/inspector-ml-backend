@@ -160,11 +160,19 @@ def signal_before_tool_callback(*args: Any, **kwargs: Any) -> Any:
 
 
 def _sanitize_history_for_anthropic(callback_context, llm_request):
-    """Strip orphaned tool_use/tool_result pairs from prior agents in SequentialAgent history."""
+    """Strip orphaned tool_use/tool_result pairs from PRIOR agents only.
+    Keeps the current agent's own tool calls intact."""
     if not hasattr(llm_request, 'contents') or not llm_request.contents:
         return None
+    last_user_idx = -1
+    for i, content in enumerate(llm_request.contents):
+        if getattr(content, 'role', '') == 'user':
+            last_user_idx = i
     cleaned = []
-    for content in llm_request.contents:
+    for i, content in enumerate(llm_request.contents):
+        if i > last_user_idx:
+            cleaned.append(content)
+            continue
         parts = getattr(content, 'parts', None)
         if not parts:
             cleaned.append(content)
