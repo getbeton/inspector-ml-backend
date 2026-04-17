@@ -285,50 +285,13 @@ def emit_dwh_analytics(payload: Dict[str, Any], tool_context: Any = None) -> Dic
 
 
 def _sanitize_history_for_anthropic(callback_context, llm_request):
-    """Strip orphaned tool_use/tool_result pairs from PRIOR agents only.
-    Keeps the current agent's own tool calls intact so it can see its own results.
-    Anthropic requires strict tool_use→tool_result pairing; cross-agent history breaks this.
-
-    In ADK, tool results arrive as role='user' messages with function_response
-    parts — NOT genuine user messages.  We must find the last *genuine* user
-    message (one with text parts and no function_response) to mark the boundary
-    between prior-agent history and the current agent's own turns."""
-    if not hasattr(llm_request, 'contents') or not llm_request.contents:
-        return None
-
-    # Find the last genuine user message (text, not a tool result).
-    last_genuine_user_idx = -1
-    for i, content in enumerate(llm_request.contents):
-        if getattr(content, 'role', '') != 'user':
-            continue
-        parts = getattr(content, 'parts', None) or []
-        has_text = any(getattr(p, 'text', None) for p in parts)
-        has_fn_resp = any(getattr(p, 'function_response', None) is not None for p in parts)
-        if has_text and not has_fn_resp:
-            last_genuine_user_idx = i
-
-    if last_genuine_user_idx < 0:
-        return None
-
-    # Keep everything from the genuine user message onward (current agent).
-    # Strip function_call / function_response messages only BEFORE that boundary.
-    cleaned = []
-    for i, content in enumerate(llm_request.contents):
-        if i >= last_genuine_user_idx:
-            cleaned.append(content)
-            continue
-        parts = getattr(content, 'parts', None)
-        if not parts:
-            cleaned.append(content)
-            continue
-        has_function = any(
-            getattr(p, 'function_call', None) is not None or getattr(p, 'function_response', None) is not None
-            for p in parts
-        )
-        if has_function:
-            continue
-        cleaned.append(content)
-    llm_request.contents = cleaned
+    """No-op — ADK v1.19.0 already reformats cross-agent tool calls as
+    '[agent_name] said:' text messages via _present_other_agent_message(),
+    satisfying Anthropic's strict tool_use→tool_result pairing without
+    manual sanitization.  Previous versions of this callback stripped the
+    agent's own tool history because ADK inserts instruction content
+    (role='user' with text) after tool responses, which shifted the
+    boundary detection."""
     return None
 
 
