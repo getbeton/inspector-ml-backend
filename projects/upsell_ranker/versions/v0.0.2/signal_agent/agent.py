@@ -159,6 +159,11 @@ def signal_before_tool_callback(*args: Any, **kwargs: Any) -> Any:
     }
 
 
+import logging as _logging
+
+_sanitize_log = _logging.getLogger("sanitize_history")
+
+
 def _sanitize_history_for_anthropic(callback_context, llm_request):
     """Strip orphaned tool_use/tool_result pairs from PRIOR agents only.
     Keeps the current agent's own tool calls intact.
@@ -170,6 +175,24 @@ def _sanitize_history_for_anthropic(callback_context, llm_request):
     if not hasattr(llm_request, 'contents') or not llm_request.contents:
         return None
 
+    # Debug: log the message structure before sanitization
+    msg_summary = []
+    for i, content in enumerate(llm_request.contents):
+        role = getattr(content, 'role', '?')
+        parts = getattr(content, 'parts', None) or []
+        part_types = []
+        for p in parts:
+            if getattr(p, 'function_call', None) is not None:
+                part_types.append(f"fn_call({getattr(p.function_call, 'name', '?')})")
+            elif getattr(p, 'function_response', None) is not None:
+                part_types.append(f"fn_resp({getattr(p.function_response, 'name', '?')})")
+            elif getattr(p, 'text', None):
+                part_types.append(f"text({len(p.text)}ch)")
+            else:
+                part_types.append("other")
+        msg_summary.append(f"  [{i}] role={role} parts=[{', '.join(part_types)}]")
+    _sanitize_log.warning("BEFORE sanitize (%d msgs):\n%s", len(llm_request.contents), "\n".join(msg_summary))
+
     # Find the last genuine user message (text, not a tool result).
     last_genuine_user_idx = -1
     for i, content in enumerate(llm_request.contents):
@@ -180,6 +203,8 @@ def _sanitize_history_for_anthropic(callback_context, llm_request):
         has_fn_resp = any(getattr(p, 'function_response', None) is not None for p in parts)
         if has_text and not has_fn_resp:
             last_genuine_user_idx = i
+
+    _sanitize_log.warning("last_genuine_user_idx=%d", last_genuine_user_idx)
 
     if last_genuine_user_idx < 0:
         return None
@@ -202,6 +227,8 @@ def _sanitize_history_for_anthropic(callback_context, llm_request):
         if has_function:
             continue
         cleaned.append(content)
+
+    _sanitize_log.warning("AFTER sanitize: %d -> %d msgs", len(llm_request.contents), len(cleaned))
     llm_request.contents = cleaned
     return None
 
