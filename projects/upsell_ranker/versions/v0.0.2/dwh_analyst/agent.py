@@ -284,6 +284,28 @@ def emit_dwh_analytics(payload: Dict[str, Any], tool_context: Any = None) -> Dic
     return data
 
 
+def _sanitize_history_for_anthropic(callback_context, llm_request):
+    """Strip orphaned tool_use/tool_result pairs from prior agents in the SequentialAgent history.
+    Anthropic requires strict tool_use→tool_result pairing; cross-agent history breaks this."""
+    if not hasattr(llm_request, 'contents') or not llm_request.contents:
+        return None
+    cleaned = []
+    for content in llm_request.contents:
+        parts = getattr(content, 'parts', None)
+        if not parts:
+            cleaned.append(content)
+            continue
+        has_function = any(
+            getattr(p, 'function_call', None) is not None or getattr(p, 'function_response', None) is not None
+            for p in parts
+        )
+        if has_function:
+            continue
+        cleaned.append(content)
+    llm_request.contents = cleaned
+    return None
+
+
 root_agent = Agent(
     model=MODEL,
     name="dwh_analyst",
@@ -291,6 +313,7 @@ root_agent = Agent(
     generate_content_config=types.GenerateContentConfig(
         response_mime_type="application/json"
     ),
+    before_model_callback=_sanitize_history_for_anthropic,
     tools=[inspector_dwh_eda, emit_dwh_analytics],
     instruction=(
         "You are the dwh_analyst. You receive company context and must explore the user's DWH.\n"

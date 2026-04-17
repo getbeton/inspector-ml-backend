@@ -159,7 +159,28 @@ def signal_before_tool_callback(*args: Any, **kwargs: Any) -> Any:
     }
 
 
-def _llm_kwargs(output_key: str = "") -> Dict[str, Any]:
+def _sanitize_history_for_anthropic(callback_context, llm_request):
+    """Strip orphaned tool_use/tool_result pairs from prior agents in SequentialAgent history."""
+    if not hasattr(llm_request, 'contents') or not llm_request.contents:
+        return None
+    cleaned = []
+    for content in llm_request.contents:
+        parts = getattr(content, 'parts', None)
+        if not parts:
+            cleaned.append(content)
+            continue
+        has_function = any(
+            getattr(p, 'function_call', None) is not None or getattr(p, 'function_response', None) is not None
+            for p in parts
+        )
+        if has_function:
+            continue
+        cleaned.append(content)
+    llm_request.contents = cleaned
+    return None
+
+
+def _llm_kwargs(output_key: str = "", sanitize_history: bool = False) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     try:
         sig = inspect.signature(LlmAgent.__init__)
@@ -169,12 +190,15 @@ def _llm_kwargs(output_key: str = "") -> Dict[str, Any]:
         kwargs["before_tool_callback"] = signal_before_tool_callback
     if output_key and "output_key" in sig.parameters:
         kwargs["output_key"] = output_key
+    if sanitize_history and "before_model_callback" in sig.parameters:
+        kwargs["before_model_callback"] = _sanitize_history_for_anthropic
     return kwargs
 
 
 bootstrap_agent = LlmAgent(
     name="signal_bootstrap_agent",
     model=MODEL,
+    before_model_callback=_sanitize_history_for_anthropic,
     tools=[
         initialize_signal_run,
         list_tables,
