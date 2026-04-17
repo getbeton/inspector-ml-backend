@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 import agentops
 from shared.inspector import inspector_env, inspector_post
 from google.adk.agents.llm_agent import Agent
-from google.adk.models.google_llm import Gemini
+from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,7 +13,7 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model=os.getenv("DWH_ANALYST_MODEL", "gemini-3-flash-preview"))
+MODEL = LiteLlm(model=os.getenv("DWH_ANALYST_MODEL", "anthropic/claude-opus-4-6"))
 
 from .tools import inspector_dwh_eda
 

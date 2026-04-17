@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 import agentops
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
-from google.adk.models.google_llm import Gemini
+from google.adk.models.lite_llm import LiteLlm
 
 from .tools import (
     dedupe_candidate,
@@ -28,9 +28,9 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model=os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"))
-REVIEWER_MODEL = Gemini(
-    model=os.getenv("SIGNAL_REVIEWER_MODEL", os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"))
+MODEL = LiteLlm(model=os.getenv("SIGNAL_AGENT_MODEL", "anthropic/claude-opus-4-6"))
+REVIEWER_MODEL = LiteLlm(
+    model=os.getenv("SIGNAL_REVIEWER_MODEL", os.getenv("SIGNAL_AGENT_MODEL", "anthropic/claude-opus-4-6"))
 )
 
 

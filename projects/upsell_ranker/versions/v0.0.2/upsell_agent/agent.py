@@ -7,7 +7,7 @@ import agentops
 import requests
 from google.adk.agents import SequentialAgent
 from google.adk.agents.llm_agent import Agent
-from google.adk.models.google_llm import Gemini
+from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,7 +15,9 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model=os.getenv("UPSELL_AGENT_MODEL", "gemini-3-flash-preview"))
+MODEL = LiteLlm(model=os.getenv("UPSELL_AGENT_MODEL", "anthropic/claude-opus-4-6"))
+
+FIRECRAWL_BASE_URL = os.getenv("FIRECRAWL_BASE_URL", "http://136.112.10.193:3002")
 
 from shared.cache import cache_read_json, cache_write_json
 from shared.inspector import inspector_env, inspector_post
@@ -220,20 +222,43 @@ def fetch_company_homepage(
         return cached
 
     try:
-        resp = requests.get(url, timeout=timeout_sec)
-        payload = {
-            "status": "success",
-            "url": url,
-            "status_code": resp.status_code,
-            "content_type": resp.headers.get("content-type"),
-            "text": resp.text[:120_000],
-        }
-    except Exception as exc:
-        payload = {
-            "status": "error",
-            "url": url,
-            "error": str(exc),
-        }
+        # Try Firecrawl first (JS rendering + proxy rotation)
+        fc_resp = requests.post(
+            f"{FIRECRAWL_BASE_URL}/v1/scrape",
+            headers={"Authorization": "Bearer self-hosted"},
+            json={"url": url, "formats": ["markdown", "html"], "onlyMainContent": True},
+            timeout=30,
+        )
+        fc_data = fc_resp.json()
+        if fc_data.get("success") and fc_data.get("data", {}).get("markdown"):
+            payload = {
+                "status": "success",
+                "url": url,
+                "status_code": 200,
+                "content_type": "text/markdown",
+                "text": fc_data["data"]["markdown"][:120_000],
+                "source": "firecrawl",
+            }
+        else:
+            raise ValueError(f"Firecrawl returned no content: {fc_data.get('error', 'unknown')}")
+    except Exception:
+        # Fallback to plain requests
+        try:
+            resp = requests.get(url, timeout=timeout_sec)
+            payload = {
+                "status": "success",
+                "url": url,
+                "status_code": resp.status_code,
+                "content_type": resp.headers.get("content-type"),
+                "text": resp.text[:120_000],
+                "source": "requests",
+            }
+        except Exception as exc:
+            payload = {
+                "status": "error",
+                "url": url,
+                "error": str(exc),
+            }
     cache_write_json(cache_key, payload)
     if tool_context is not None:
         state = getattr(tool_context, "state", None)
