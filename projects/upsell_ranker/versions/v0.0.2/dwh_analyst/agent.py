@@ -287,21 +287,34 @@ def emit_dwh_analytics(payload: Dict[str, Any], tool_context: Any = None) -> Dic
 def _sanitize_history_for_anthropic(callback_context, llm_request):
     """Strip orphaned tool_use/tool_result pairs from PRIOR agents only.
     Keeps the current agent's own tool calls intact so it can see its own results.
-    Anthropic requires strict tool_use→tool_result pairing; cross-agent history breaks this."""
+    Anthropic requires strict tool_use→tool_result pairing; cross-agent history breaks this.
+
+    In ADK, tool results arrive as role='user' messages with function_response
+    parts — NOT genuine user messages.  We must find the last *genuine* user
+    message (one with text parts and no function_response) to mark the boundary
+    between prior-agent history and the current agent's own turns."""
     if not hasattr(llm_request, 'contents') or not llm_request.contents:
         return None
-    # Find where the current agent's messages start — the last user message
-    # marks the boundary between prior agent history and current agent turns.
-    last_user_idx = -1
+
+    # Find the last genuine user message (text, not a tool result).
+    last_genuine_user_idx = -1
     for i, content in enumerate(llm_request.contents):
-        role = getattr(content, 'role', '')
-        if role == 'user':
-            last_user_idx = i
-    # Strip function messages only BEFORE the last user message (prior agent history).
-    # Keep everything from the last user message onward (current agent's own turns).
+        if getattr(content, 'role', '') != 'user':
+            continue
+        parts = getattr(content, 'parts', None) or []
+        has_text = any(getattr(p, 'text', None) for p in parts)
+        has_fn_resp = any(getattr(p, 'function_response', None) is not None for p in parts)
+        if has_text and not has_fn_resp:
+            last_genuine_user_idx = i
+
+    if last_genuine_user_idx < 0:
+        return None
+
+    # Keep everything from the genuine user message onward (current agent).
+    # Strip function_call / function_response messages only BEFORE that boundary.
     cleaned = []
     for i, content in enumerate(llm_request.contents):
-        if i > last_user_idx:
+        if i >= last_genuine_user_idx:
             cleaned.append(content)
             continue
         parts = getattr(content, 'parts', None)
