@@ -14,18 +14,20 @@ flowchart LR
     Scripts[Optional local scripts] -. probes .-> Outputs
 ```
 
-The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as PostHog, Attio, and similar integrations is planned but not implemented yet.
+The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as [PostHog](https://www.getbeton.ai/integrations/posthog/), [Attio](https://www.getbeton.ai/integrations/attio/), and [similar integrations](https://www.getbeton.ai/integrations/) is planned but not implemented yet.
 
 ## Product Context
 
 This repository is the `inspector-ml-backend` for Beton. It is not the full product surface by itself.
 
-- Product website: `https://getbeton.ai`
+- Product website: [www.getbeton.ai](https://www.getbeton.ai/)
+- Pricing and hosted trial: [www.getbeton.ai/pricing](https://www.getbeton.ai/pricing/)
+- Integrations catalog: [www.getbeton.ai/integrations](https://www.getbeton.ai/integrations/)
 - Demo stand / product-facing repo: `https://github.com/getbeton/inspector/tree/staging`
 
 Use those references to understand the product this backend connects to:
 
-- `getbeton.ai` is the public product entry point for Beton.
+- [getbeton.ai](https://www.getbeton.ai/) is the public product entry point for Beton.
 - The `getbeton/inspector` staging branch is the demo stand and product-facing layer that sits in front of this ML/backend repo.
 - This repository provides the agent workflows and warehouse-analysis backend that the Beton product layer can call into.
 
@@ -132,7 +134,7 @@ TELEGRAM_DB_PASSWORD=
 
 - This repository is licensed under AGPLv3. See `LICENSE`.
 - Beton Inspector is currently the security-focused product path for protected warehouse access in the newest agent versions.
-- Direct standalone integration flags for systems such as PostHog and Attio are planned.
+- Direct standalone integration flags for systems such as [PostHog](https://www.getbeton.ai/integrations/posthog/) and [Attio](https://www.getbeton.ai/integrations/attio/) are planned.
 - Recent experiments show that explicitly defining the target metric for an agent is the strongest lever on analysis quality.
 
 ## Notes
