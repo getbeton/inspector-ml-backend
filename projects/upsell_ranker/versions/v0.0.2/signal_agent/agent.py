@@ -4,23 +4,22 @@ from typing import Any, Dict
 
 import agentops
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
-from google.adk.models.google_llm import Gemini
+from shared.model_factory import build_gemini
+
+try:
+    from google.adk.models.google_llm import _ResourceExhaustedError
+except Exception:  # pragma: no cover - runtime compatibility guard
+    _ResourceExhaustedError = Exception
 
 from .tools import (
     dedupe_candidate,
-    describe_table,
     finalize_experiment_report,
-    get_signal_objective,
-    get_warehouse_profile,
-    infer_signal_objective,
-    initialize_signal_run,
-    list_tables,
+    get_signal_objective_compact,
+    get_warehouse_profile_compact,
     load_existing_signals,
-    profile_events,
+    prepare_signal_inputs,
     run_readonly_query,
-    sample_rows,
     store_candidate_signal,
-    store_warehouse_profile,
     validate_sql_policy,
 )
 
@@ -28,9 +27,10 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model=os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"))
-REVIEWER_MODEL = Gemini(
-    model=os.getenv("SIGNAL_REVIEWER_MODEL", os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"))
+MODEL = build_gemini("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview")
+REVIEWER_MODEL = build_gemini(
+    "SIGNAL_REVIEWER_MODEL",
+    os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"),
 )
 
 
@@ -97,20 +97,35 @@ class ScopedLoopAgent(LoopAgent):
     async def _run_async_impl(self, *args: Any, **kwargs: Any):
         should_exit = False
         ctx = args[0] if args else kwargs.get("ctx")
-        async for event in super()._run_async_impl(*args, **kwargs):
-            actions = getattr(event, "actions", None)
-            if actions is not None and getattr(actions, "escalate", False):
-                should_exit = True
-                try:
-                    actions.escalate = False
-                except Exception:
-                    pass
-            yield event
-            if should_exit:
-                break
-            author = getattr(event, "author", "") or getattr(getattr(event, "invocation_metadata", None), "agent", "")
-            if author == "signal_iteration_pipeline" and ctx is not None and self._should_exit_from_state(ctx):
-                break
+        try:
+            async for event in super()._run_async_impl(*args, **kwargs):
+                actions = getattr(event, "actions", None)
+                if actions is not None and getattr(actions, "escalate", False):
+                    should_exit = True
+                    try:
+                        actions.escalate = False
+                    except Exception:
+                        pass
+                yield event
+                if should_exit:
+                    break
+                author = getattr(event, "author", "") or getattr(getattr(event, "invocation_metadata", None), "agent", "")
+                if author == "signal_iteration_pipeline" and ctx is not None and self._should_exit_from_state(ctx):
+                    break
+        except _ResourceExhaustedError as exc:
+            state = getattr(getattr(ctx, "session", None), "state", None)
+            if state is not None:
+                detail = str(exc)
+                state["quota_exhausted_error"] = detail
+                state["last_loop_status"] = {
+                    "ok": False,
+                    "iteration_index": int(state.get("iteration_index") or 0),
+                    "reason": "resource_exhausted_retry_exhausted",
+                    "should_exit": True,
+                    "detail": detail,
+                }
+                state.setdefault("loop_iteration_events", []).append(state["last_loop_status"])
+            return
 
 
 def _tool_name_from_callback_args(args: tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
@@ -172,39 +187,25 @@ def _llm_kwargs(output_key: str = "") -> Dict[str, Any]:
     return kwargs
 
 
-bootstrap_agent = LlmAgent(
-    name="signal_bootstrap_agent",
+signal_prep_agent = LlmAgent(
+    name="signal_prep_agent",
     model=MODEL,
-    tools=[
-        initialize_signal_run,
-        list_tables,
-        describe_table,
-        sample_rows,
-        profile_events,
-        infer_signal_objective,
-        store_warehouse_profile,
-    ],
-    **_llm_kwargs(output_key="signal_bootstrap"),
+    tools=[prepare_signal_inputs],
+    **_llm_kwargs(output_key="signal_prep"),
     instruction=(
-        "You are the bootstrap stage for signal_agent.\n"
+        "You prepare signal_agent state from upstream upsell_agent and dwh_analyst outputs.\n"
         "\n"
         "Hard constraints:\n"
-        "- Read-only behavior only.\n"
-        "- Use tools only, no invented schema.\n"
-        "- Assume PostHog-style events/persons are likely but verify via table discovery.\n"
-        "- Tool calls must be sequential: call -> inspect response -> next call.\n"
-        "- Do not call the same tool twice with identical arguments.\n"
-        "- Never emit narrative prose after tool calls; either call the next tool or return final JSON.\n"
+        "- Do not redo website discovery or broad warehouse discovery.\n"
+        "- Use upstream shared state as the source of truth.\n"
+        "- Call prepare_signal_inputs exactly once.\n"
+        "- Pass session_id from input when present.\n"
+        "- Return compact JSON only.\n"
         "\n"
         "Workflow:\n"
-        "1) Call initialize_signal_run first and pass session_id from input.\n"
-        "2) Call list_tables, then describe_table for likely events/persons tables.\n"
-        "3) Call sample_rows for one likely events table and one likely persons table when available.\n"
-        "4) Call profile_events for one likely events table.\n"
-        "5) Infer likely semantic columns (time/event/person/session/group/properties).\n"
-        "6) Call infer_signal_objective exactly once (hint defaults to user_signup).\n"
-        "7) Call store_warehouse_profile exactly once and include objective fields.\n"
-        "8) Return short JSON only with success_event_name, failure rule, and key columns.\n"
+        "1) Extract session_id from the input if present.\n"
+        "2) Call prepare_signal_inputs exactly once.\n"
+        "3) Return the resulting JSON only.\n"
     ),
 )
 
@@ -213,8 +214,8 @@ explorer_agent = LlmAgent(
     model=MODEL,
     tools=[
         load_existing_signals,
-        get_warehouse_profile,
-        get_signal_objective,
+        get_warehouse_profile_compact,
+        get_signal_objective_compact,
         dedupe_candidate,
         store_candidate_signal,
         validate_sql_policy,
@@ -233,7 +234,7 @@ explorer_agent = LlmAgent(
         "Allowed SQL subset (strict):\n"
         "- Use a single SELECT statement.\n"
         "- Use conditional aggregations only: countIf/sumIf/uniqIf/avgIf.\n"
-        "- Use allowlisted base tables discovered via list_tables/describe_table.\n"
+        "- Use allowlisted base tables prepared from upstream warehouse metadata.\n"
         "- Use explicit bounded time filters and LIMIT.\n"
         "\n"
         "Hard constraints:\n"
@@ -251,6 +252,8 @@ explorer_agent = LlmAgent(
         "- Do not use blocked functions/patterns: arrayJoin, numbers*, remote*, url(), CROSS JOIN, INTO OUTFILE, LOAD_FILE.\n"
         "- For recent vs baseline comparisons, use a single SELECT with conditional aggregation.\n"
         "- Do not call schema discovery tools in this stage; bootstrap already handled schema discovery.\n"
+        "- Do not spend query budget on rediscovery checks such as top events, date range scans, event existence checks, or generic top pages.\n"
+        "- The single run_readonly_query call must validate the current candidate hypothesis itself.\n"
         "- Never emit prose like 'I will now...' or 'the experiment is complete'. Return compact JSON only.\n"
         "\n"
         "Window priors:\n"
@@ -258,7 +261,8 @@ explorer_agent = LlmAgent(
         "- include cohort discrimination evidence (success vs failure vs grey) in promotion_evidence.\n"
         "\n"
         "Workflow each iteration:\n"
-        "1) Call get_signal_objective and get_warehouse_profile first.\n"
+        "1) Call get_signal_objective_compact and get_warehouse_profile_compact first.\n"
+        "   If success_proxy_mode is present, treat success_event_name as a conversion proxy label rather than a literal event that must exist in the events table.\n"
         "2) Load existing signals.\n"
         "3) Use prior stored candidates/reviews to avoid repeating the same hypothesis.\n"
         "4) Propose one candidate hypothesis tied to success_event_name.\n"
@@ -274,14 +278,15 @@ explorer_agent = LlmAgent(
         "Candidate fields must include:\n"
         "name, entity_grain, time_window, comparison_baseline, query_template,\n"
         "parameter_set, interpretation, promotion_evidence, target_event, status.\n"
-        "Return JSON only.\n"
+        "promotion_evidence must always be a JSON object, never a string.\n"
+        "After store_candidate_signal, return only compact ack JSON with candidate name, status, and stored_as when available.\n"
     ),
 )
 
 reviewer_agent = LlmAgent(
     name="signal_reviewer_agent",
     model=REVIEWER_MODEL,
-    tools=[get_signal_objective, store_candidate_signal],
+    tools=[get_signal_objective_compact, store_candidate_signal],
     **_llm_kwargs(output_key="signal_reviewer_iteration"),
     instruction=(
         "You are the Reviewer in a two-LLM loop.\n"
@@ -292,7 +297,7 @@ reviewer_agent = LlmAgent(
         "- Reject vague grain.\n"
         "- Reject if no meaningful temporal logic.\n"
         "- Reject trivial descriptive summaries.\n"
-        "- Reject candidates not tied to success_event_name.\n"
+        "- Reject candidates not tied to success_event_name, except when success_proxy_mode is present; in that case allow proxy-aligned hypotheses without a literal event-name match.\n"
         "- Reject candidates missing cohort discrimination evidence.\n"
         "- Approve only reusable conversion-oriented signal checks.\n"
         "- Reject any candidate that uses UNION/UNION ALL.\n"
@@ -304,12 +309,13 @@ reviewer_agent = LlmAgent(
         "- Never emit narrative prose or completion summaries. Return compact JSON only.\n"
         "\n"
         "Workflow:\n"
-        "1) Call get_signal_objective to load success/failure priors.\n"
+        "1) Call get_signal_objective_compact to load success/failure priors.\n"
+        "   If success_proxy_mode is present, interpret success_event_name as a proxy conversion label rather than a required literal event.\n"
         "2) Build ReviewDecision JSON with decision=approve|reject and promotion_readiness boolean.\n"
         "3) Call store_candidate_signal once with candidate + review_decision.\n"
         "4) Set promoted=true,status=promoted only when candidate is reusable and execution evidence is meaningful.\n"
         "5) Do not attempt to terminate the loop; only review the current candidate.\n"
-        "6) Return concise JSON decision only.\n"
+        "6) Return concise ack JSON with decision, promoted flag, and stored_as when available.\n"
     ),
 )
 
@@ -338,7 +344,7 @@ finalize_agent = LlmAgent(
 
 root_agent = SequentialAgent(
     name="signal_agent",
-    sub_agents=[bootstrap_agent, discovery_loop_agent, finalize_agent],
+    sub_agents=[signal_prep_agent, discovery_loop_agent, finalize_agent],
 )
 
 # Best-effort RunConfig export for runners that support it.

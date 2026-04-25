@@ -5,15 +5,15 @@ from typing import Any, Dict, List
 import agentops
 from shared.inspector import inspector_env, inspector_post
 from google.adk.agents.llm_agent import Agent
-from google.adk.models.google_llm import Gemini
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
+from shared.model_factory import build_gemini
 
 AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
-MODEL = Gemini(model=os.getenv("DWH_ANALYST_MODEL", "gemini-3-flash-preview"))
+MODEL = build_gemini("DWH_ANALYST_MODEL", "gemini-3-flash-preview")
 
 from .tools import inspector_dwh_eda
 
@@ -281,7 +281,14 @@ def emit_dwh_analytics(payload: Dict[str, Any], tool_context: Any = None) -> Dic
                     state = getattr(tool_context, "state", None)
                     if state is not None:
                         state["inspector_write_summary"] = {"status": "error", "error": str(exc)}
-    return data
+    return {
+        "ok": True,
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+        "table_count": len(data.get("table_summaries") or []),
+        "join_candidate_count": len(data.get("join_candidates") or []),
+        "stored": True,
+    }
 
 
 root_agent = Agent(
@@ -317,8 +324,9 @@ root_agent = Agent(
         "   Focus on columns tied to money or expansion potential: ARR, MRR, revenue, invoice amount,\n"
         "   subscription period/days, renewal/churn, seats/licenses, usage volume, or sales pipeline.\n"
         "   For each item include at least table_id/table, column, and short reason.\n"
+        "10) After the tool call, return only compact ack JSON with workspace_id, session_id, table_count, join_candidate_count, and stored=true.\n"
         "\n"
-        "Output JSON (schema is provisional):\n"
+        "Tool input JSON (schema is provisional):\n"
         "{\n"
         "  \"schema_version\": \"v0.0.1\",\n"
         "  \"summary_text\": \"2-4 sentences on discovered tables, assumptions, and join hints.\",\n"
