@@ -1,3 +1,5 @@
+"""Warehouse metadata helpers for the v0.0.2 DWH analyst."""
+
 from typing import Any, Dict, List, Optional
 
 from shared.cache import cache_read_json, cache_write_json

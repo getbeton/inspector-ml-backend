@@ -10,4 +10,4 @@ COPY . /app
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-CMD ["bash", "-lc", "adk api_server --host 0.0.0.0 --port ${PORT:-8000} /app/upsell_ranker_full/v0.0.2"]
+CMD ["bash", "-lc", "adk api_server --host 0.0.0.0 --port ${PORT:-8000} /app/projects/upsell_ranker/versions/v0.0.2"]
