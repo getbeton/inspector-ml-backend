@@ -95,6 +95,16 @@ def _init_langfuse() -> None:
         _LOG.warning("GoogleADKInstrumentor.instrument() failed: %s", exc)
         return
 
+    # OpenInference doesn't capture token usage from LiteLLM-fronted models,
+    # so we install our own callback that attaches usage + cost to the
+    # currently-active OTel span.
+    try:
+        from .litellm_otel import register_litellm_otel_logger
+
+        register_litellm_otel_logger()
+    except Exception as exc:
+        _LOG.warning("litellm OTel adapter registration failed: %s", exc)
+
     try:
         client = get_client()
         if client.auth_check():
