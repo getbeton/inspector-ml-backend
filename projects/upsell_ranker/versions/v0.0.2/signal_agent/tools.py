@@ -585,7 +585,10 @@ def _execute_sql_proxy(session_id: str, sql: str) -> Dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "error": "sql_proxy_error", "detail": str(exc)}
     cache_write_json(cache_key, resp)
-    return {"ok": True, "cached": False, "types": resp.get("types"), "results": resp.get("results", [])}
+    # Inspector's sql-proxy returns column metadata under `columns` (PostHog
+    # naming), older paths returned `types`. Accept either.
+    column_meta = resp.get("types") or resp.get("columns") or []
+    return {"ok": True, "cached": False, "types": column_meta, "results": resp.get("results", [])}
 
 
 def run_readonly_query(

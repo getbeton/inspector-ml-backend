@@ -1,0 +1,4 @@
+_session_export_*/
+_session_export_*.zip
+.venv/
+artifacts/
