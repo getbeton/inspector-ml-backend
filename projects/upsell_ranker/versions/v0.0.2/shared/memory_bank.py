@@ -56,8 +56,10 @@ def _all_docs() -> Mapping[str, MemoryBankDoc]:
 AGENT_DOC_PLAN: Mapping[str, Sequence[str]] = {
     "upsell": ("founding-sales", "monetization-pricing"),
     "dwh": ("running-lean", "monetization-pricing"),
+    "bootstrap": ("running-lean",),  # frames what success_event means
     "explorer": ("running-lean", "hypotheses-generation", "rice-prioritization"),
     "reviewer": ("rice-prioritization", "cohort-retention-analysis"),
+    "finalize": ("rice-prioritization",),  # context for what's worth surfacing
 }
 
 
@@ -79,14 +81,29 @@ def render_for(role: str) -> str:
     """Render the memory-bank context block to splice into an agent's
     instruction string. Each doc gets a delimited section so the model
     can cite by name.
+
+    The header tells the agent how to use the docs (read, cite by short
+    name, refuse to contradict). The agent's own instruction should still
+    reinforce this with a "Workflow step 0: read the memory bank above"
+    line — see signal_agent / dwh_analyst / upsell_agent for examples.
     """
     docs = docs_for(role)
+    doc_names = [d.name for d in docs]
     sections = ["=== MEMORY BANK START ===\n"]
     sections.append(
-        "The sections below contain the team's prior knowledge on signal "
-        "discovery, prioritization, and pricing. Treat them as ground truth "
-        "before issuing any tool call. Do not contradict them without "
-        "explicitly flagging the contradiction in your output.\n"
+        f"The {len(docs)} section(s) below ({', '.join(doc_names)}) contain "
+        "the team's prior knowledge on signal discovery, prioritization, "
+        "cohort math, and pricing.\n\n"
+        "Mandatory read-before-act protocol:\n"
+        "1. Before issuing any tool call, read each section in this block.\n"
+        "2. When you author SQL, hypotheses, or rankings, name the doc(s) "
+        "you drew from in your output's `mechanism_rationale` (or equivalent) "
+        "field. Cite by the short name (e.g. 'rice-prioritization') so a "
+        "reviewer can audit which advice you applied.\n"
+        "3. Treat these docs as ground truth. Do not contradict them; if you "
+        "must, flag the contradiction explicitly in your output and explain.\n"
+        "4. The fingerprints (sha256 prefixes) below are checked at startup. "
+        "If a doc is missing, the process aborts before any LLM call.\n"
     )
     for d in docs:
         sections.append(f"\n--- {d.name} (sha256:{d.sha256[:8]}) ---\n{d.body}")

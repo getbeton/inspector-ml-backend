@@ -42,6 +42,18 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _strip_litellm_provider_prefix(model: Optional[str]) -> Optional[str]:
+    """LiteLLM model strings are `<provider>/<model>` (e.g.
+    `gemini/gemini-3-flash-preview`). Langfuse's pricing table keys are
+    bare model names. Strip the prefix so Langfuse can compute cost from
+    its own pricing table when we don't supply one explicitly."""
+    if not model:
+        return model
+    if "/" in model:
+        return model.split("/", 1)[1]
+    return model
+
+
 def _set_span_token_attrs(
     *,
     model: Optional[str],
@@ -49,12 +61,25 @@ def _set_span_token_attrs(
     completion_tokens: Optional[int],
     total_tokens: Optional[int],
     cost_usd: Optional[float],
+    cost_input: Optional[float] = None,
+    cost_output: Optional[float] = None,
 ) -> None:
     """Attach token + cost attributes to the currently-active OTel span.
 
-    Uses both OpenInference (`llm.token_count.*`) and OTel GenAI semconv
-    (`gen_ai.usage.*`) names so Langfuse's parser picks them up regardless
-    of which convention it favours.
+    Uses three sets of attribute names so Langfuse picks up usage + cost
+    regardless of which convention its parser is on:
+
+    - OpenInference   (`llm.token_count.{prompt,completion,total}`,
+                       `llm.model_name`)
+    - OTel GenAI semconv (`gen_ai.usage.{input,output,prompt,completion}_tokens`,
+                          `gen_ai.response.model`)
+    - Langfuse-native (`langfuse.observation.{model,usage_details,cost_details,
+                       input_cost,output_cost,total_cost}`)
+
+    Sets the bare model name (without the LiteLLM `<provider>/` prefix) so
+    Langfuse's built-in pricing table can compute cost when we don't supply
+    one. Sets explicit cost attributes when LiteLLM did compute one,
+    breaking it down into input/output where possible.
     """
     try:
         from opentelemetry import trace
@@ -66,9 +91,12 @@ def _set_span_token_attrs(
     if span is None or not span.is_recording():
         return
 
-    if model:
-        span.set_attribute("llm.model_name", model)
-        span.set_attribute("gen_ai.response.model", model)
+    bare_model = _strip_litellm_provider_prefix(model)
+    if bare_model:
+        span.set_attribute("llm.model_name", bare_model)
+        span.set_attribute("gen_ai.response.model", bare_model)
+        span.set_attribute("langfuse.observation.model", bare_model)
+        span.set_attribute("gen_ai.system", (model or "").split("/", 1)[0] if "/" in (model or "") else "")
 
     if prompt_tokens is not None:
         span.set_attribute("llm.token_count.prompt", prompt_tokens)
@@ -82,9 +110,14 @@ def _set_span_token_attrs(
         span.set_attribute("llm.token_count.total", total_tokens)
 
     if cost_usd is not None:
-        # Langfuse-specific aliases: total_cost is what the UI surfaces.
-        span.set_attribute("langfuse.observation.cost_details", str(cost_usd))
-        span.set_attribute("gen_ai.usage.cost", cost_usd)
+        # Langfuse maps these directly into observation.totalCost. Round to
+        # 6 decimals to keep span-attr float noise out of summaries.
+        span.set_attribute("langfuse.observation.total_cost", round(float(cost_usd), 6))
+        span.set_attribute("gen_ai.usage.cost", round(float(cost_usd), 6))
+    if cost_input is not None:
+        span.set_attribute("langfuse.observation.input_cost", round(float(cost_input), 6))
+    if cost_output is not None:
+        span.set_attribute("langfuse.observation.output_cost", round(float(cost_output), 6))
 
 
 def _extract_usage(response_obj: Any) -> dict:
@@ -132,12 +165,34 @@ def _extract_usage(response_obj: Any) -> dict:
         or _get(hidden, "model")
     )
 
+    # Best-effort split cost into input/output so Langfuse can render
+    # cost-by-direction. LiteLLM doesn't always provide this — fall back to
+    # the price tables baked into litellm.cost_calculator.
+    cost_input = _get(hidden, "input_cost") or _get(hidden, "prompt_cost")
+    cost_output = _get(hidden, "output_cost") or _get(hidden, "completion_cost")
+    if cost is not None and cost_input is None and cost_output is None:
+        try:
+            from litellm import cost_per_token
+
+            split = cost_per_token(
+                model=model or "",
+                prompt_tokens=_to_int(prompt) or 0,
+                completion_tokens=_to_int(completion) or 0,
+            )
+            # `cost_per_token` returns (prompt_cost, completion_cost)
+            if isinstance(split, tuple) and len(split) == 2:
+                cost_input, cost_output = split
+        except Exception:
+            pass
+
     return {
         "model": str(model) if model else None,
         "prompt_tokens": _to_int(prompt),
         "completion_tokens": _to_int(completion),
         "total_tokens": _to_int(total),
         "cost_usd": _to_float(cost),
+        "cost_input": _to_float(cost_input),
+        "cost_output": _to_float(cost_output),
     }
 
 
