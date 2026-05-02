@@ -295,9 +295,6 @@ root_agent = Agent(
     model=MODEL,
     name="dwh_analyst",
     description="Explores the user's DWH to find relevant tables, columns, and join candidates.",
-    generate_content_config=types.GenerateContentConfig(
-        response_mime_type="application/json"
-    ),
     tools=[inspector_dwh_eda, emit_dwh_analytics],
     instruction=(
         "You are the dwh_analyst. You receive company context and must explore the user's DWH.\n"

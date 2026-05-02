@@ -390,9 +390,6 @@ upsell_worker = Agent(
     model=MODEL,
     name="upsell_worker",
     description="Explores user company context and captures website summary context.",
-    generate_content_config=types.GenerateContentConfig(
-        response_mime_type="application/json"
-    ),
     tools=[
         fetch_company_homepage,
         emit_website_summary,
@@ -442,9 +439,6 @@ pipeline_finalize_agent = Agent(
     model=MODEL,
     name="upsell_pipeline_finalize",
     description="Assembles the end-to-end upsell pipeline output.",
-    generate_content_config=types.GenerateContentConfig(
-        response_mime_type="application/json"
-    ),
     tools=[emit_pipeline_report],
     instruction=(
         "You finalize the stitched upsell pipeline output.\n"
