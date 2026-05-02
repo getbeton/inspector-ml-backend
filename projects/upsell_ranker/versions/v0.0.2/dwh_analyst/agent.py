@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 
 import agentops
 from shared.inspector import inspector_env, inspector_post
+from shared.memory_bank import render_for as _memory_bank_for
 from google.adk.agents.llm_agent import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
@@ -305,6 +306,7 @@ root_agent = Agent(
     before_model_callback=_sanitize_history_for_anthropic,
     tools=[inspector_dwh_eda, emit_dwh_analytics],
     instruction=(
+        _memory_bank_for("dwh") + "\n"
         "You are the dwh_analyst. You receive company context and must explore the user's DWH.\n"
         "\n"
         "Hard constraints:\n"

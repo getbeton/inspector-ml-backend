@@ -21,6 +21,7 @@ FIRECRAWL_BASE_URL = os.getenv("FIRECRAWL_BASE_URL", "http://136.112.10.193:3002
 
 from shared.cache import cache_read_json, cache_write_json
 from shared.inspector import inspector_env, inspector_post
+from shared.memory_bank import render_for as _memory_bank_for
 
 
 def _infer_is_b2b(business_model: str) -> bool:
@@ -280,6 +281,7 @@ upsell_worker = Agent(
         emit_website_summary,
     ],
     instruction=(
+        _memory_bank_for("upsell") + "\n"
         "You are the upsell_worker for the upsale opportunity system. The user provides a company website URL.\n"
         "\n"
         "Hard constraints:\n"

@@ -1,5 +1,7 @@
 anthropic
 litellm
+langfuse
+openinference-instrumentation-google-adk
 agentops==0.4.21
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2

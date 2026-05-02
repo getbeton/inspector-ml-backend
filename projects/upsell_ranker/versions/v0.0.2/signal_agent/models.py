@@ -108,3 +108,50 @@ class ExperimentReport(BaseModel):
     rerun_success_rate: float = 0.0
     hypothesis_passed: bool = False
     notes: List[str] = Field(default_factory=list)
+
+
+class BatchedHypothesisDraft(BaseModel):
+    """One candidate inside an Explorer batch payload. Drafted in a single
+    LLM round; deterministic per-candidate validate→execute→store happens
+    inside `propose_batch_candidates`, not via further LLM calls."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    entity_grain: str
+    time_window: str
+    comparison_baseline: str
+    query_template: str
+    parameter_set: Dict[str, Any] = Field(default_factory=dict)
+    interpretation: str
+    target_event: str = ""
+
+
+class BatchedHypothesesPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    candidates: List[BatchedHypothesisDraft] = Field(default_factory=list)
+
+
+class RiceRanking(BaseModel):
+    """One row of the Reviewer's RICE batch. `decision` is what the agent
+    wants — `store_candidate_signal` still gates on success-target
+    alignment + cohort evidence + promotion_readiness."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    decision: str = "skip"
+    reach: float = 0.0
+    impact: float = 0.0
+    confidence: float = 0.0
+    effort: float = 1.0
+    rice_score: float = 0.0
+    rationale: str = ""
+    required_fixes: List[str] = Field(default_factory=list)
+
+
+class RicePrioritizationPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    rankings: List[RiceRanking] = Field(default_factory=list)

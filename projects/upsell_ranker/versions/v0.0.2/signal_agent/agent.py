@@ -6,10 +6,13 @@ import agentops
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 
+from shared.memory_bank import render_for as _memory_bank_for
+
 from .tools import (
     dedupe_candidate,
     describe_table,
     finalize_experiment_report,
+    get_pending_candidates,
     get_signal_objective,
     get_warehouse_profile,
     infer_signal_objective,
@@ -17,6 +20,8 @@ from .tools import (
     list_tables,
     load_existing_signals,
     profile_events,
+    propose_batch_candidates,
+    rice_prioritize_batch,
     run_readonly_query,
     sample_rows,
     store_candidate_signal,
@@ -243,6 +248,7 @@ explorer_agent = LlmAgent(
     ],
     **_llm_kwargs(output_key="signal_explorer_iteration"),
     instruction=(
+        _memory_bank_for("explorer") + "\n"
         "You are the Explorer in a two-LLM signal discovery loop.\n"
         "\n"
         "Mission:\n"
@@ -322,6 +328,7 @@ reviewer_agent = LlmAgent(
     tools=[get_signal_objective, store_candidate_signal],
     **_llm_kwargs(output_key="signal_reviewer_iteration"),
     instruction=(
+        _memory_bank_for("reviewer") + "\n"
         "You are the Reviewer in a two-LLM loop.\n"
         "Review Explorer candidate for safety semantics, schema plausibility, grain clarity,\n"
         "temporal logic, nontriviality, and rerunnability.\n"
@@ -366,6 +373,143 @@ discovery_loop_agent = ScopedLoopAgent(
     max_iterations=int(os.getenv("SIGNAL_AGENT_MAX_ITERATIONS", "8")),
 )
 
+
+# ── Batched (single-pass) Explorer + Reviewer ─────────────────────────────
+#
+# Replaces the LoopAgent-driven iterative path. Explorer emits N candidates
+# in one LLM round; `propose_batch_candidates` validates/executes/stores all
+# of them deterministically. Reviewer reads the stored batch, ranks with RICE,
+# and `rice_prioritize_batch` applies promotion decisions.
+#
+# Target call budget per scenario (validated via Langfuse trace count, T-C):
+#   Explorer ≤ 8 LLM calls (down from 51) — typically 3–4.
+#   Reviewer ≤ 5 LLM calls (down from 22) — typically 2–3.
+
+batched_explorer_agent = LlmAgent(
+    name="signal_batched_explorer_agent",
+    model=MODEL,
+    tools=[
+        load_existing_signals,
+        get_warehouse_profile,
+        get_signal_objective,
+        propose_batch_candidates,
+    ],
+    **_llm_kwargs(output_key="signal_batched_explorer"),
+    instruction=(
+        _memory_bank_for("explorer") + "\n"
+        "You are the Explorer in a single-pass batched signal discovery pipeline.\n"
+        "\n"
+        "Mission:\n"
+        "- Propose a BATCH of N=6 candidate signals in ONE batch call.\n"
+        "- Each candidate must predict pre-conversion upsell opportunity for users\n"
+        "  who did NOT yet complete success_event.\n"
+        "- Each candidate must align to success_event_name from get_signal_objective.\n"
+        "- You are the only role allowed to author SQL/HogQL.\n"
+        "\n"
+        "Allowed SQL subset (strict — same as before):\n"
+        "- Single SELECT statement.\n"
+        "- Conditional aggregations only: countIf/sumIf/uniqIf/avgIf.\n"
+        "- Allowlisted base tables only (discovered via bootstrap).\n"
+        "- Explicit bounded time filters and LIMIT.\n"
+        "- No UNION/UNION ALL, CASE, CAST, arrayJoin, numbers*, remote*, url(), CROSS JOIN, INTO OUTFILE, LOAD_FILE.\n"
+        "- Do not join events.distinct_id to persons.id.\n"
+        "- Prefer events.distinct_id as person-level grain.\n"
+        "\n"
+        "MANDATORY column naming for promotion to be possible:\n"
+        "Each candidate's SQL MUST SELECT columns named EXACTLY:\n"
+        "  success_cohort_size, failure_cohort_size, grey_cohort_size,\n"
+        "  conversion_lift, conversion_rate_delta, precision_proxy.\n"
+        "Use AS aliases on conditional-aggregation expressions to produce these names.\n"
+        "Without these named columns, propose_batch_candidates cannot extract\n"
+        "promotion_evidence and the candidate cannot be promoted.\n"
+        "\n"
+        "Workflow (≤4 LLM calls):\n"
+        "1) Call get_signal_objective AND get_warehouse_profile AND load_existing_signals\n"
+        "   in parallel within a single round.\n"
+        "2) Compose the batch: 6 distinct hypotheses, each with full draft fields.\n"
+        "   Hypotheses should explore DIFFERENT mechanisms (path patterns,\n"
+        "   recency thresholds, intent signals, cohort comparisons), not variations\n"
+        "   of the same one.\n"
+        "3) Call propose_batch_candidates ONCE with the full list. Inspect the\n"
+        "   per-candidate result.\n"
+        "4) If duplicates/policy_blocked/execution_failed cause stored<3, propose\n"
+        "   ONE replacement batch (≤3 candidates) addressing the rejection reasons.\n"
+        "   Do NOT loop further — Reviewer makes the final calls.\n"
+        "\n"
+        "Each candidate dict MUST include:\n"
+        "- name, entity_grain, time_window, comparison_baseline\n"
+        "- query_template (single SELECT with the 6 mandatory named columns)\n"
+        "- parameter_set (string-substituted values for {{token}} or {token} placeholders)\n"
+        "- interpretation, target_event (must equal success_event_name)\n"
+        "\n"
+        "Output: After the batch tool call(s), return compact JSON only:\n"
+        "{\"stored\": <int>, \"duplicates\": <int>, \"policy_blocked\": <int>,\n"
+        " \"execution_failed\": <int>, \"invalid\": <int>}.\n"
+        "\n"
+        "Do not call validate_sql_policy or run_readonly_query directly — \n"
+        "propose_batch_candidates does that for every candidate atomically.\n"
+        "Do not call store_candidate_signal directly.\n"
+        "Never emit narrative prose. Return JSON only.\n"
+    ),
+)
+
+batched_reviewer_agent = LlmAgent(
+    name="signal_batched_reviewer_agent",
+    model=REVIEWER_MODEL,
+    tools=[get_signal_objective, get_pending_candidates, rice_prioritize_batch],
+    **_llm_kwargs(output_key="signal_batched_reviewer"),
+    instruction=(
+        _memory_bank_for("reviewer") + "\n"
+        "You are the Reviewer in a single-pass batched signal discovery pipeline.\n"
+        "Rank ALL pending candidates with RICE in ONE batch call.\n"
+        "\n"
+        "Workflow (≤3 LLM calls):\n"
+        "1) Call get_signal_objective AND get_pending_candidates in parallel within\n"
+        "   a single round to load the success target and the full candidate batch.\n"
+        "2) Score every candidate with RICE:\n"
+        "   - reach: estimated affected user count (raw number, not %).\n"
+        "   - impact: 1=minimal, 3=high (anchored to conversion lift / cohort size).\n"
+        "   - confidence: 0.0–1.0 (anchored to cohort discrimination evidence).\n"
+        "   - effort: 1=trivial query rerun, 5=expensive backfill (default 1).\n"
+        "   - rice_score = (reach × impact × confidence) / effort.\n"
+        "   Use cohort-retention-analysis and rice-prioritization memory-bank docs\n"
+        "   as the rubric.\n"
+        "3) For each candidate, set decision='promote' if it passes ALL of:\n"
+        "   - clear entity grain + time window + comparison baseline\n"
+        "   - meaningful temporal logic (not a one-off snapshot)\n"
+        "   - tied to success_event_name\n"
+        "   - has cohort discrimination evidence (the 6 named columns from Explorer)\n"
+        "   - non-trivial RICE score (top half of the batch by rice_score)\n"
+        "   Otherwise decision='skip'.\n"
+        "4) Call rice_prioritize_batch ONCE with the full list of rankings.\n"
+        "5) If rice_prioritize_batch returns promoted<target_promoted (default 3) and\n"
+        "   any candidates were promote_blocked, do NOT retry — the gates are policy,\n"
+        "   not LLM judgement. Final answer.\n"
+        "\n"
+        "Hard constraints:\n"
+        "- Reject vague grain or trivial descriptive summaries.\n"
+        "- Reject candidates not tied to success_event_name.\n"
+        "- Reject candidates missing cohort discrimination evidence.\n"
+        "- The deterministic policy tools are the ultimate safety authority — \n"
+        "  rice_prioritize_batch will block promotion if cohort evidence or\n"
+        "  success-target alignment is missing.\n"
+        "- Never emit narrative prose or completion summaries. Return compact JSON only.\n"
+        "\n"
+        "Each ranking dict MUST include:\n"
+        "  name (matching candidate.name), decision ('promote'|'skip'),\n"
+        "  reach, impact, confidence, effort, rice_score, rationale.\n"
+        "\n"
+        "Output: After rice_prioritize_batch, return compact JSON only:\n"
+        "{\"promoted\": <int>, \"skipped\": <int>, \"promote_blocked\": <int>,\n"
+        " \"not_found\": <int>}.\n"
+    ),
+)
+
+batched_pipeline_agent = SequentialAgent(
+    name="signal_batched_pipeline",
+    sub_agents=[batched_explorer_agent, batched_reviewer_agent],
+)
+
 finalize_agent = LlmAgent(
     name="signal_finalize_agent",
     model=MODEL,
@@ -378,10 +522,21 @@ finalize_agent = LlmAgent(
     ),
 )
 
-root_agent = SequentialAgent(
-    name="signal_agent",
-    sub_agents=[bootstrap_agent, discovery_loop_agent, finalize_agent],
-)
+def _batch_enabled() -> bool:
+    raw = os.getenv("BATCH_HYPOTHESES", "true").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+if _batch_enabled():
+    root_agent = SequentialAgent(
+        name="signal_agent",
+        sub_agents=[bootstrap_agent, batched_pipeline_agent, finalize_agent],
+    )
+else:
+    root_agent = SequentialAgent(
+        name="signal_agent",
+        sub_agents=[bootstrap_agent, discovery_loop_agent, finalize_agent],
+    )
 
 # Best-effort RunConfig export for runners that support it.
 try:

@@ -14,11 +14,15 @@ from shared.cache import cache_read_json, cache_write_json
 from shared.inspector import inspector_env, inspector_get, inspector_post
 
 from .models import (
+    BatchedHypothesesPayload,
+    BatchedHypothesisDraft,
     CandidateSignalDraft,
     ExecutionOutcome,
     ExperimentReport,
     PromotedSignal,
     ReviewDecision,
+    RicePrioritizationPayload,
+    RiceRanking,
     SignalObjective,
     WarehouseProfile,
 )
@@ -1297,6 +1301,412 @@ def dedupe_candidate(sql_or_semantics: str, tool_context: Any = None) -> Dict[st
         if normalized and normalized in haystacks:
             duplicates.append(idx)
     return {"ok": True, "is_duplicate": bool(duplicates), "duplicate_indexes": duplicates}
+
+
+_COHORT_EVIDENCE_KEYS = (
+    "success_cohort_size",
+    "failure_cohort_size",
+    "grey_cohort_size",
+    "conversion_lift",
+    "conversion_rate_delta",
+    "precision_proxy",
+)
+
+
+def _extract_cohort_evidence(columns: Any, rows: Any) -> Dict[str, Any]:
+    """Best-effort cohort metrics extraction from a query result.
+
+    Looks for columns whose names match the canonical cohort evidence keys
+    (case-insensitive). If found, takes the value from the first row.
+    Returns an empty dict when the SQL doesn't follow the convention —
+    `_candidate_has_cohort_evidence` will then reject the candidate, so
+    the LLM is forced to author SQL that emits the expected named columns.
+    """
+    if not isinstance(rows, list) or not rows:
+        return {}
+    first = rows[0]
+    if isinstance(first, dict):
+        lookup = {str(k).strip().lower(): v for k, v in first.items()}
+    elif isinstance(first, (list, tuple)):
+        col_names: List[str] = []
+        if isinstance(columns, list):
+            for entry in columns:
+                if isinstance(entry, dict):
+                    col_names.append(str(entry.get("name") or "").strip().lower())
+                elif isinstance(entry, (list, tuple)) and entry:
+                    col_names.append(str(entry[0]).strip().lower())
+                else:
+                    col_names.append(str(entry).strip().lower())
+        lookup = {col_names[i]: first[i] for i in range(min(len(col_names), len(first)))}
+    else:
+        return {}
+    evidence: Dict[str, Any] = {}
+    for key in _COHORT_EVIDENCE_KEYS:
+        if key in lookup:
+            try:
+                value = lookup[key]
+                if value is None:
+                    continue
+                if isinstance(value, bool):
+                    evidence[key] = value
+                else:
+                    evidence[key] = float(value) if "." in str(value) or isinstance(value, float) else int(value)
+            except (TypeError, ValueError):
+                evidence[key] = lookup[key]
+    return evidence
+
+
+def get_pending_candidates(tool_context: Any = None) -> Dict[str, Any]:
+    """Return all stored candidate hypotheses for the Reviewer to rank.
+
+    Reviewer batch ranks ALL pending candidates in a single LLM call,
+    instead of reviewing one per loop iteration."""
+    state = _state_from_context(tool_context)
+    candidates = state.get("candidate_hypotheses") or []
+    promoted = state.get("promoted_signals") or []
+    promoted_names = {str(s.get("name") or "").strip() for s in promoted if isinstance(s, dict)}
+    pending: List[Dict[str, Any]] = []
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        name = str(cand.get("name") or "").strip()
+        if name and name in promoted_names:
+            continue
+        if str(cand.get("status") or "").lower() == "promoted":
+            continue
+        pending.append(cand)
+    objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+    return {
+        "ok": True,
+        "count": len(pending),
+        "candidates": pending,
+        "success_event_name": objective.get("success_event_name") or "",
+    }
+
+
+def propose_batch_candidates(
+    candidates: List[Dict[str, Any]],
+    session_id: str = "",
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    """Deterministically validate, execute, and store a batch of Explorer candidates.
+
+    The Explorer emits a list of candidate drafts in a single LLM round; this
+    tool runs the per-candidate side effects (dedupe → policy → query → store)
+    without further LLM calls, collapsing what was previously ~6 round-trips
+    per candidate into ~0 LLM rounds.
+
+    Each candidate must include name/entity_grain/time_window/comparison_baseline/
+    query_template/parameter_set/interpretation/target_event. SQL must SELECT
+    columns named with the canonical cohort-evidence keys (success_cohort_size,
+    failure_cohort_size, grey_cohort_size, conversion_lift,
+    conversion_rate_delta, precision_proxy) for promotion to be possible.
+
+    Returns one entry per candidate with status: stored | duplicate | policy_blocked
+    | execution_failed | invalid.
+    """
+    state = _state_from_context(tool_context)
+    try:
+        if not isinstance(candidates, list) or not candidates:
+            return {"ok": False, "error": "empty_batch", "results": []}
+
+        max_batch = _to_int_env("SIGNAL_AGENT_BATCH_MAX_CANDIDATES", 10)
+        if len(candidates) > max_batch:
+            candidates = candidates[:max_batch]
+
+        sid = _session_id_arg(session_id, state)
+        if not sid:
+            return {"ok": False, "error": "missing_session_id"}
+
+        results: List[Dict[str, Any]] = []
+        stored = 0
+        duplicates = 0
+        policy_blocked_count = 0
+        execution_failed = 0
+        invalid_count = 0
+
+        for raw in candidates:
+            if not isinstance(raw, dict):
+                invalid_count += 1
+                results.append({
+                    "ok": False,
+                    "status": "invalid",
+                    "error": "candidate_not_object",
+                })
+                continue
+            ok_draft, validated_draft = _safe_model_validate(BatchedHypothesisDraft, raw)
+            if not ok_draft:
+                invalid_count += 1
+                results.append({
+                    "ok": False,
+                    "status": "invalid",
+                    "name": str(raw.get("name") or ""),
+                    "error": "draft_validation_failed",
+                    "detail": validated_draft.get("detail") if isinstance(validated_draft, dict) else "",
+                })
+                continue
+
+            draft = validated_draft
+            name = str(draft.get("name") or "").strip()
+            template = str(draft.get("query_template") or "")
+            params = draft.get("parameter_set") or {}
+            rendered_sql = _render_template(template, params) if params else template
+            unresolved = _find_unresolved_template_tokens(rendered_sql)
+
+            # Dedupe against prior candidates by query_template + name.
+            dedupe = dedupe_candidate(rendered_sql or template, tool_context=tool_context)
+            if dedupe.get("is_duplicate"):
+                duplicates += 1
+                results.append({
+                    "ok": False,
+                    "status": "duplicate",
+                    "name": name,
+                    "duplicate_indexes": dedupe.get("duplicate_indexes", []),
+                })
+                continue
+
+            if unresolved:
+                invalid_count += 1
+                results.append({
+                    "ok": False,
+                    "status": "invalid",
+                    "name": name,
+                    "error": "unresolved_template_parameters",
+                    "unresolved_tokens": unresolved,
+                })
+                continue
+
+            policy = validate_sql_policy(rendered_sql, tool_context=tool_context)
+            if not policy.get("allowed"):
+                policy_blocked_count += 1
+                results.append({
+                    "ok": False,
+                    "status": "policy_blocked",
+                    "name": name,
+                    "rejection_class": policy.get("rejection_class", ""),
+                    "violations": policy.get("violations", []),
+                    "rewrite_hints": policy.get("rewrite_hints", []),
+                })
+                continue
+
+            execution = run_readonly_query(
+                sql=rendered_sql,
+                purpose=f"batch_explorer:{name}",
+                expected_grain=str(draft.get("entity_grain") or ""),
+                session_id=sid,
+                tool_context=tool_context,
+            )
+            if not execution.get("ok"):
+                execution_failed += 1
+                results.append({
+                    "ok": False,
+                    "status": "execution_failed",
+                    "name": name,
+                    "error": execution.get("error", ""),
+                    "violations": execution.get("violations", []),
+                    "detail": execution.get("detail", ""),
+                })
+                continue
+
+            evidence = _extract_cohort_evidence(execution.get("columns"), execution.get("rows"))
+            candidate_payload = {
+                "name": name,
+                "entity_grain": str(draft.get("entity_grain") or ""),
+                "time_window": str(draft.get("time_window") or ""),
+                "comparison_baseline": str(draft.get("comparison_baseline") or ""),
+                "query_template": template,
+                "parameter_set": params,
+                "interpretation": str(draft.get("interpretation") or ""),
+                "target_event": str(draft.get("target_event") or ""),
+                "promotion_evidence": evidence,
+                "execution_outcome": {
+                    "status": "ok",
+                    "purpose": f"batch_explorer:{name}",
+                    "expected_grain": str(draft.get("entity_grain") or ""),
+                    "sql": str(execution.get("query") or ""),
+                    "row_count": int(execution.get("row_count") or 0),
+                    "column_count": len(execution.get("columns") or []),
+                    "cached": bool(execution.get("cached")),
+                    "notes": "",
+                },
+                "status": "candidate",
+            }
+            store_result = store_candidate_signal(candidate_payload, tool_context=tool_context)
+            if store_result.get("ok"):
+                stored += 1
+                results.append({
+                    "ok": True,
+                    "status": "stored",
+                    "name": name,
+                    "row_count": int(execution.get("row_count") or 0),
+                    "has_cohort_evidence": bool(evidence),
+                })
+            else:
+                invalid_count += 1
+                results.append({
+                    "ok": False,
+                    "status": "invalid",
+                    "name": name,
+                    "error": store_result.get("error", "store_failed"),
+                    "detail": store_result.get("detail", ""),
+                })
+
+        summary = {
+            "ok": True,
+            "batch_size": len(candidates),
+            "stored": stored,
+            "duplicates": duplicates,
+            "policy_blocked": policy_blocked_count,
+            "execution_failed": execution_failed,
+            "invalid": invalid_count,
+            "results": results,
+        }
+        state.setdefault("explorer_batch_summaries", []).append({
+            "at": _utc_now(),
+            **{k: v for k, v in summary.items() if k != "results"},
+        })
+        _record_artifact(state, "explorer_batch_summaries", summary, append=True)
+        return summary
+    except Exception as exc:
+        return _tool_exception("propose_batch_candidates", exc, state)
+
+
+def rice_prioritize_batch(
+    rankings: List[Dict[str, Any]],
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    """Apply Reviewer's RICE batch decisions to stored candidates.
+
+    For every ranking with decision='promote', look up the candidate by
+    name and call `store_candidate_signal` with promotion intent. Promotion
+    still gates on `_candidate_mentions_success_target` and
+    `_candidate_has_cohort_evidence` — RICE alone does not bypass those.
+
+    Returns one entry per ranking with status: promoted | promote_blocked |
+    skipped | not_found | invalid.
+    """
+    state = _state_from_context(tool_context)
+    try:
+        if not isinstance(rankings, list) or not rankings:
+            return {"ok": False, "error": "empty_rankings", "results": []}
+        ok_payload, payload = _safe_model_validate(
+            RicePrioritizationPayload,
+            {"rankings": rankings},
+        )
+        if not ok_payload:
+            return {
+                "ok": False,
+                "error": "rankings_validation_failed",
+                "detail": payload.get("detail", "") if isinstance(payload, dict) else "",
+            }
+
+        candidates = state.get("candidate_hypotheses") or []
+        candidate_index = {
+            str(c.get("name") or "").strip(): c
+            for c in candidates
+            if isinstance(c, dict) and (c.get("name"))
+        }
+
+        results: List[Dict[str, Any]] = []
+        promoted_count = 0
+        skipped = 0
+        not_found = 0
+        promote_blocked = 0
+        invalid_count = 0
+
+        for ranking in payload.get("rankings") or []:
+            name = str(ranking.get("name") or "").strip()
+            decision = str(ranking.get("decision") or "skip").strip().lower()
+            if not name:
+                invalid_count += 1
+                results.append({"ok": False, "status": "invalid", "error": "missing_name"})
+                continue
+
+            if decision in ("skip", "defer", "drop", "reject"):
+                skipped += 1
+                review_payload = {
+                    "decision": "reject",
+                    "reasons": [str(ranking.get("rationale") or "rice_skip")],
+                    "promotion_readiness": False,
+                    "promoted": False,
+                    "rice_score": float(ranking.get("rice_score") or 0.0),
+                }
+                cand = candidate_index.get(name)
+                if cand is not None:
+                    payload_for_store = dict(cand)
+                    payload_for_store["review_decision"] = review_payload
+                    store_candidate_signal(payload_for_store, tool_context=tool_context)
+                results.append({
+                    "ok": True,
+                    "status": "skipped",
+                    "name": name,
+                    "rice_score": float(ranking.get("rice_score") or 0.0),
+                })
+                continue
+
+            cand = candidate_index.get(name)
+            if cand is None:
+                not_found += 1
+                results.append({
+                    "ok": False,
+                    "status": "not_found",
+                    "name": name,
+                })
+                continue
+
+            review_payload = {
+                "decision": "approve",
+                "reasons": [str(ranking.get("rationale") or "rice_promote")],
+                "promotion_readiness": True,
+                "promoted": True,
+                "rice_score": float(ranking.get("rice_score") or 0.0),
+                "reach": float(ranking.get("reach") or 0.0),
+                "impact": float(ranking.get("impact") or 0.0),
+                "confidence": float(ranking.get("confidence") or 0.0),
+                "effort": float(ranking.get("effort") or 1.0),
+            }
+            promote_payload = dict(cand)
+            promote_payload["promoted"] = True
+            promote_payload["status"] = "promoted"
+            promote_payload["review_decision"] = review_payload
+            store_result = store_candidate_signal(promote_payload, tool_context=tool_context)
+            if store_result.get("stored_as") == "promoted_signal":
+                promoted_count += 1
+                results.append({
+                    "ok": True,
+                    "status": "promoted",
+                    "name": name,
+                    "rice_score": float(ranking.get("rice_score") or 0.0),
+                })
+            else:
+                promote_blocked += 1
+                results.append({
+                    "ok": False,
+                    "status": "promote_blocked",
+                    "name": name,
+                    "reason": store_result.get("promotion_block_reason", "")
+                              or store_result.get("error", "")
+                              or "promotion_gate_failed",
+                })
+
+        summary = {
+            "ok": True,
+            "rankings_count": len(rankings),
+            "promoted": promoted_count,
+            "skipped": skipped,
+            "not_found": not_found,
+            "promote_blocked": promote_blocked,
+            "invalid": invalid_count,
+            "results": results,
+        }
+        state.setdefault("rice_batch_summaries", []).append({
+            "at": _utc_now(),
+            **{k: v for k, v in summary.items() if k != "results"},
+        })
+        _record_artifact(state, "rice_batch_summaries", summary, append=True)
+        return summary
+    except Exception as exc:
+        return _tool_exception("rice_prioritize_batch", exc, state)
 
 
 def _shift_param_dates(param_set: Dict[str, Any], shift_days: int) -> Dict[str, Any]:
