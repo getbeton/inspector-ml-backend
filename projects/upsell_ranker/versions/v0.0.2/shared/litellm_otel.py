@@ -120,10 +120,13 @@ def _set_span_token_attrs(
         span.set_attribute("langfuse.observation.output_cost", round(float(cost_output), 6))
 
 
-def _extract_usage(response_obj: Any) -> dict:
+def _extract_usage(response_obj: Any, kwargs: Optional[dict] = None) -> dict:
     """Return `{model, prompt_tokens, completion_tokens, total_tokens, cost}` from
     a LiteLLM ModelResponse / response_obj. Tolerates dict, pydantic, or
-    attribute-style access. Returns {} when nothing usable is found.
+    attribute-style access. Falls back to the callback's `kwargs['model']`
+    when the response itself doesn't carry the model name (some Gemini paths
+    return ModelResponse with model=None). Returns {} when nothing usable
+    is found.
     """
     if response_obj is None:
         return {}
@@ -163,7 +166,26 @@ def _extract_usage(response_obj: Any) -> dict:
         _get(response_obj, "model")
         or _get(_get(response_obj, "model_response"), "model")
         or _get(hidden, "model")
+        or (_get(kwargs or {}, "model"))
+        or (_get(_get(kwargs or {}, "litellm_params") or {}, "model"))
     )
+
+    # If LiteLLM didn't populate response_cost but we have token counts +
+    # a model, compute cost from LiteLLM's pricing table directly. Gemini
+    # via LiteLLM frequently leaves response_cost unset.
+    if cost is None and model and (prompt or completion):
+        try:
+            from litellm import cost_per_token
+
+            split = cost_per_token(
+                model=model,
+                prompt_tokens=_to_int(prompt) or 0,
+                completion_tokens=_to_int(completion) or 0,
+            )
+            if isinstance(split, tuple) and len(split) == 2:
+                cost = (split[0] or 0.0) + (split[1] or 0.0)
+        except Exception:
+            pass
 
     # Best-effort split cost into input/output so Langfuse can render
     # cost-by-direction. LiteLLM doesn't always provide this — fall back to
@@ -212,7 +234,7 @@ def register_litellm_otel_logger() -> None:
     class OtelUsageLogger(CustomLogger):  # type: ignore[misc]
         def log_success_event(self, kwargs, response_obj, start_time, end_time):
             try:
-                usage = _extract_usage(response_obj)
+                usage = _extract_usage(response_obj, kwargs=kwargs)
                 if not any(usage.values()):
                     return
                 _set_span_token_attrs(**usage)
