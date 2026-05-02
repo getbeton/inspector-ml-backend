@@ -15,6 +15,12 @@ AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
     agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
 
+# ADK loads each agent directly without importing the v0.0.2 package
+# __init__.py, so wire OTel/Langfuse observability at agent-import time.
+from shared.observability import init_observability  # noqa: E402
+
+init_observability()
+
 MODEL = LiteLlm(model=os.getenv("UPSELL_AGENT_MODEL", "anthropic/claude-opus-4-6"))
 
 FIRECRAWL_BASE_URL = os.getenv("FIRECRAWL_BASE_URL", "http://136.112.10.193:3002")

@@ -7,6 +7,12 @@ from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 
 from shared.memory_bank import render_for as _memory_bank_for
+from shared.observability import init_observability
+
+# ADK loads each agent module directly without importing the v0.0.2 package
+# `__init__.py`, so we wire observability at agent-import time. The function
+# is idempotent and logs once on first call.
+init_observability()
 
 from .tools import (
     dedupe_candidate,
