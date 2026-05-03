@@ -1522,9 +1522,19 @@ def propose_batch_candidates(
         if not isinstance(candidates, list) or not candidates:
             return {"ok": False, "error": "empty_batch", "results": []}
 
-        max_batch = _to_int_env("SIGNAL_AGENT_BATCH_MAX_CANDIDATES", 10)
-        if len(candidates) > max_batch:
-            candidates = candidates[:max_batch]
+        # `SIGNAL_AGENT_BATCH_MAX_CANDIDATES` is a target told to the
+        # Explorer's prompt — it now describes "candidates per propose_*
+        # call", not "max Mason will keep". Process every candidate the
+        # Explorer emits so the Reviewer always sees the full picture.
+        # Hard ceiling stays at 50 to bound a runaway prompt; warn into
+        # state if the Explorer exceeds the target by 2× so the next run
+        # can investigate.
+        target_per_call = _to_int_env("SIGNAL_AGENT_BATCH_MAX_CANDIDATES", 10)
+        hard_ceiling = max(target_per_call * 3, 50)
+        if len(candidates) > hard_ceiling:
+            candidates = candidates[:hard_ceiling]
+            state.setdefault("explorer_overflow_count", 0)
+            state["explorer_overflow_count"] += 1
 
         sid = _session_id_arg(session_id, state)
         if not sid:
