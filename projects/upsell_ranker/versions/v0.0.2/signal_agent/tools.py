@@ -1089,19 +1089,35 @@ def _candidate_mentions_success_target(payload: Dict[str, Any], objective: Dict[
 
 
 def _candidate_has_cohort_evidence(payload: Dict[str, Any]) -> bool:
+    """Promotion gate. Requires REAL statistical significance, not just the
+    presence of the canonical column names. Specifically:
+
+      1. The candidate's promotion_evidence dict must contain the six raw
+         cohort counts (signal_*/control_*) — these come from
+         `_extract_cohort_evidence`, which only populates them when the
+         Explorer's SQL emitted columns named that way over real data.
+      2. The computed `significant` flag must be True. `_compute_cohort_metrics`
+         sets it based on:
+           - p-value ≤ SIG_LEVEL (default 0.05, two-tailed two-proportion z-test)
+           - lift ≥ MIN_LIFT     (default 1.10, i.e. ≥ 10% relative)
+           - both cohorts have n ≥ MIN_COHORT_N (default 30) so the test has power.
+
+    A candidate that emits the column NAMES but with hardcoded scalar
+    literals will fail #2: hardcoded values produce a degenerate test
+    (zero variance, infinite z, or low_power), and the gate stays False.
+    """
     evidence = payload.get("promotion_evidence")
     if not isinstance(evidence, dict):
         return False
-    required_markers = {
-        "success_cohort_size",
-        "failure_cohort_size",
-        "grey_cohort_size",
-        "conversion_lift",
-        "conversion_rate_delta",
-        "precision_proxy",
-    }
-    if any(marker in evidence for marker in required_markers):
-        return True
+
+    raw_keys = (
+        "signal_success", "signal_failure", "signal_grey",
+        "control_success", "control_failure", "control_grey",
+    )
+    if not any(k in evidence for k in raw_keys):
+        return False
+
+    return bool(evidence.get("significant"))
     return bool(evidence.get("cohort_metrics"))
 
 
@@ -1306,24 +1322,115 @@ def dedupe_candidate(sql_or_semantics: str, tool_context: Any = None) -> Dict[st
     return {"ok": True, "is_duplicate": bool(duplicates), "duplicate_indexes": duplicates}
 
 
-_COHORT_EVIDENCE_KEYS = (
-    "success_cohort_size",
-    "failure_cohort_size",
-    "grey_cohort_size",
-    "conversion_lift",
-    "conversion_rate_delta",
-    "precision_proxy",
+import math
+
+# Canonical SQL output convention for promotion-eligible candidates.
+#
+# Mason asks the Explorer to emit only the SIX raw counts; everything
+# else (lift, delta, z-score, p-value, significance flag) is computed
+# in Python so the model can't fabricate the discrimination metrics.
+_COHORT_RAW_KEYS = (
+    "signal_success",   # users with the signal AND has_success=1
+    "signal_failure",   # users with the signal AND has_failure=1 (inactive ≥ N days, no success)
+    "signal_grey",      # users with the signal AND still in-flight (active in last N days, no success)
+    "control_success",  # users WITHOUT the signal AND has_success=1
+    "control_failure",  # users WITHOUT the signal AND has_failure=1
+    "control_grey",     # users WITHOUT the signal AND in-flight
 )
+
+# Tunables for the statistical promotion gate. Override via env.
+_SIG_LEVEL = 0.05         # two-tailed p-value cutoff
+_MIN_LIFT = 1.10          # minimum effect size (10% relative lift)
+_MIN_COHORT_N = 30        # minimum n per cohort for the test to apply
+
+
+def _normal_cdf(x: float) -> float:
+    """Standard-normal CDF via erf. Same precision as scipy for our needs."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _two_proportion_z(s1: int, n1: int, s2: int, n2: int) -> Tuple[float, float]:
+    """Two-proportion z-test. Returns (z, two-tailed p-value).
+    s1/n1 = with-signal successes/total, s2/n2 = control successes/total.
+    """
+    if n1 <= 0 or n2 <= 0:
+        return 0.0, 1.0
+    p1 = s1 / n1
+    p2 = s2 / n2
+    p_pooled = (s1 + s2) / (n1 + n2)
+    if p_pooled in (0.0, 1.0):
+        return 0.0, 1.0
+    se = math.sqrt(p_pooled * (1.0 - p_pooled) * (1.0 / n1 + 1.0 / n2))
+    if se == 0.0:
+        return 0.0, 1.0
+    z = (p1 - p2) / se
+    p_value = 2.0 * (1.0 - _normal_cdf(abs(z)))
+    return z, p_value
+
+
+def _compute_cohort_metrics(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Given the six raw counts, compute lift / delta / z / p_value / sig flag."""
+    s_succ = int(raw.get("signal_success") or 0)
+    s_fail = int(raw.get("signal_failure") or 0)
+    s_grey = int(raw.get("signal_grey") or 0)
+    c_succ = int(raw.get("control_success") or 0)
+    c_fail = int(raw.get("control_failure") or 0)
+    c_grey = int(raw.get("control_grey") or 0)
+
+    n_signal = s_succ + s_fail
+    n_control = c_succ + c_fail
+    signal_cr = s_succ / n_signal if n_signal else 0.0
+    control_cr = c_succ / n_control if n_control else 0.0
+    lift = (signal_cr / control_cr) if control_cr > 0 else 0.0
+    delta_pp = signal_cr - control_cr
+
+    z, p_value = _two_proportion_z(s_succ, n_signal, c_succ, n_control)
+
+    min_n = max(n_signal, 0), max(n_control, 0)
+    low_power = (n_signal < _MIN_COHORT_N) or (n_control < _MIN_COHORT_N)
+    significant = (p_value <= _SIG_LEVEL) and (lift >= _MIN_LIFT) and not low_power
+
+    return {
+        # raw counts (round-tripped for downstream consumers)
+        "signal_success": s_succ,
+        "signal_failure": s_fail,
+        "signal_grey": s_grey,
+        "control_success": c_succ,
+        "control_failure": c_fail,
+        "control_grey": c_grey,
+        # derived metrics
+        "n_signal": n_signal,
+        "n_control": n_control,
+        "signal_cr": round(signal_cr, 6),
+        "control_cr": round(control_cr, 6),
+        "lift": round(lift, 6),
+        "delta_pp": round(delta_pp, 6),
+        "z_score": round(z, 4),
+        "p_value": round(p_value, 6),
+        "significant": bool(significant),
+        "low_power": bool(low_power),
+        "sig_level": _SIG_LEVEL,
+        "min_lift_threshold": _MIN_LIFT,
+        # legacy aliases so existing dashboards / scoring keep working
+        "success_cohort_size": s_succ,
+        "failure_cohort_size": s_fail,
+        "grey_cohort_size": s_grey,
+        "conversion_lift": round(lift, 6),
+        "conversion_rate_delta": round(delta_pp, 6),
+        "precision_proxy": round(signal_cr, 6),
+    }
 
 
 def _extract_cohort_evidence(columns: Any, rows: Any) -> Dict[str, Any]:
-    """Best-effort cohort metrics extraction from a query result.
+    """Read the six raw cohort counts from a HogQL result, then derive the
+    full statistical evidence dict via `_compute_cohort_metrics`.
 
-    Looks for columns whose names match the canonical cohort evidence keys
-    (case-insensitive). If found, takes the value from the first row.
-    Returns an empty dict when the SQL doesn't follow the convention —
-    `_candidate_has_cohort_evidence` will then reject the candidate, so
-    the LLM is forced to author SQL that emits the expected named columns.
+    The Explorer is instructed to author SQL that produces columns named
+    exactly:
+       signal_success, signal_failure, signal_grey,
+       control_success, control_failure, control_grey
+    (case-insensitive). Returns {} when none of these are present —
+    `_candidate_has_cohort_evidence` will then reject promotion.
     """
     if not isinstance(rows, list) or not rows:
         return {}
@@ -1343,20 +1450,22 @@ def _extract_cohort_evidence(columns: Any, rows: Any) -> Dict[str, Any]:
         lookup = {col_names[i]: first[i] for i in range(min(len(col_names), len(first)))}
     else:
         return {}
-    evidence: Dict[str, Any] = {}
-    for key in _COHORT_EVIDENCE_KEYS:
-        if key in lookup:
+
+    raw: Dict[str, Any] = {}
+    for key in _COHORT_RAW_KEYS:
+        if key in lookup and lookup[key] is not None:
             try:
-                value = lookup[key]
-                if value is None:
-                    continue
-                if isinstance(value, bool):
-                    evidence[key] = value
-                else:
-                    evidence[key] = float(value) if "." in str(value) or isinstance(value, float) else int(value)
+                raw[key] = int(lookup[key])
             except (TypeError, ValueError):
-                evidence[key] = lookup[key]
-    return evidence
+                try:
+                    raw[key] = int(float(lookup[key]))
+                except (TypeError, ValueError):
+                    pass
+
+    if not raw:
+        return {}
+
+    return _compute_cohort_metrics(raw)
 
 
 def get_pending_candidates(tool_context: Any = None) -> Dict[str, Any]:
