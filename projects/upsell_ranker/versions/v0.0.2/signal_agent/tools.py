@@ -45,6 +45,9 @@ BLOCKED_SQL_REGEX_PATTERNS = (
     (r"\bcross\s+join\b", "cross_join_not_allowed"),
     (r"\binto\s+outfile\b", "into_outfile_not_allowed"),
     (r"\bload_file\s*\(", "load_file_not_allowed"),
+    # PostHog HogQL doesn't implement SelectStmt.settingsClause; the proxy 400s
+    # before the agent ever sees results. Catch it client-side.
+    (r"\bsettings\s+\w+\s*=", "settings_clause_not_allowed"),
 )
 BLOCKED_FUNCTION_PATTERNS = (
     "url",
@@ -523,6 +526,7 @@ def validate_sql_policy(sql: str, tool_context: Any = None) -> Dict[str, Any]:
             "cross_join_not_allowed",
             "into_outfile_not_allowed",
             "load_file_not_allowed",
+            "settings_clause_not_allowed",
         )
     ):
         rejection_class = "syntax_forbidden"
@@ -548,6 +552,7 @@ def validate_sql_policy(sql: str, tool_context: Any = None) -> Dict[str, Any]:
             + (["Inspector blocks CAST expressions. Remove CAST(...) and rely on native numeric operations or nullIf/countIf patterns."] if "cast_not_allowed" in violations else [])
             + (["Do not use CASE expressions. Use countIf/sumIf/uniqIf/avgIf only."] if "case_expression_not_allowed" in violations else [])
             + (["CASE expressions are not allowed for signal queries; use countIf/sumIf/uniqIf/avgIf instead."] if "case_without_else_not_allowed" in violations else [])
+            + (["PostHog HogQL doesn't support a SETTINGS clause (e.g. SETTINGS allow_experimental_analyzer=1). Remove it; the same query without SETTINGS is accepted."] if "settings_clause_not_allowed" in violations else [])
             + (
                 [
                     "Avoid joining events.distinct_id to persons.id (String vs UUID mismatch). Use events.distinct_id as entity grain, or join using a verified compatible persons key."
