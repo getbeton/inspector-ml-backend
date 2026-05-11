@@ -152,6 +152,16 @@ def _state_from_context(tool_context: Any) -> Dict[str, Any]:
     state.setdefault("latest_event_profile", {})
     state.setdefault("tool_call_cache", {})
     state.setdefault("last_loop_status", {})
+    state.setdefault("signal_context_digest", {})
+    state.setdefault("signal_context_warnings", [])
+    state.setdefault("candidate_signals", [])
+    state.setdefault("candidate_fingerprints", {})
+    state.setdefault("signal_execution_summaries", [])
+    state.setdefault("rejected_signals", [])
+    state.setdefault("last_candidate_signal_id", "")
+    state.setdefault("latest_pending_candidate_for_review", {})
+    state.setdefault("review_applied_keys", [])
+    state.setdefault("last_applied_review_candidate_id", "")
     return state
 
 
@@ -259,6 +269,16 @@ def initialize_signal_run(
         state["warehouse_profile"] = {}
         state["signal_objective"] = {}
         state["latest_event_profile"] = {}
+        state["signal_context_digest"] = {}
+        state["signal_context_warnings"] = []
+        state["candidate_signals"] = []
+        state["candidate_fingerprints"] = {}
+        state["signal_execution_summaries"] = []
+        state["rejected_signals"] = []
+        state["last_candidate_signal_id"] = ""
+        state["latest_pending_candidate_for_review"] = {}
+        state["review_applied_keys"] = []
+        state["last_applied_review_candidate_id"] = ""
         state["query_count"] = 0
         state["failure_count"] = 0
         state["non_query_failure_count"] = 0
@@ -1376,6 +1396,7 @@ def prepare_signal_inputs(
     bridge = hydrate_signal_context_from_upstream(tool_context=tool_context)
     if not bridge.get("ok"):
         return bridge
+    load_existing_signals(tool_context=tool_context)
 
     initial_profile = bridge.get("warehouse_profile") or {}
     profile_result = store_warehouse_profile(initial_profile, tool_context=tool_context)
@@ -1423,6 +1444,53 @@ def prepare_signal_inputs(
     if not final_profile_result.get("ok"):
         return final_profile_result
 
+    playbook = build_signal_playbook_snippets()
+    state["signal_context_warnings"] = list(playbook.get("warnings") or [])
+    table_summaries: List[Dict[str, Any]] = []
+    for table in _upstream_table_summaries(state)[:8]:
+        identity = _table_identity(table)
+        if not identity:
+            continue
+        columns = _table_columns(table)[:8]
+        semantic = _infer_semantic_columns(columns)
+        table_summaries.append(
+            {
+                "table": identity,
+                "columns": columns,
+                "event_column": semantic.get("event", ""),
+                "time_column": semantic.get("time", ""),
+                "person_column": semantic.get("person", ""),
+            }
+        )
+    fingerprint_values = sorted(_fingerprint_lookup(state).keys())[:24]
+    state["signal_context_digest"] = {
+        "objective": {
+            "success_event_name": objective.get("success_event_name", ""),
+            "success_proxy_mode": objective.get("success_proxy_mode", ""),
+            "failure_definition": (
+                f"users with no events for >{int(objective.get('failure_inactivity_days') or 7)} days; "
+                "success cohort overrides failure"
+            ),
+            "entity_grain_preference": _string_or_empty(final_profile_result.get("warehouse_profile", {}).get("inferred_distinct_id_column")) or "distinct_id",
+        },
+        "warehouse": {
+            "allowed_tables": list(state.get("allowed_tables") or [])[:20],
+            "table_summaries": table_summaries,
+            "known_join_keys": [value for value in [person_col, session_col] if value],
+            "event_name_column": event_col,
+            "timestamp_column": time_col,
+            "constraints": [
+                "Read-only SELECT/WITH only",
+                "Use allowlisted tables only",
+                "Avoid UNION, CAST, CASE, CROSS JOIN, arrayJoin, remote/url functions",
+                "Prefer events.distinct_id as person grain unless compatibility is verified",
+            ],
+        },
+        "existing_signal_fingerprints": fingerprint_values,
+        "loop_limits": dict(state.get("loop_limits") or {}),
+        "playbook_snippets": list(playbook.get("playbook_snippets") or []),
+    }
+
     result = {
         "ok": True,
         "run_id": init_result.get("run_id"),
@@ -1432,6 +1500,8 @@ def prepare_signal_inputs(
         "success_event_name": objective.get("success_event_name", ""),
         "profile_events_status": "ok" if profile_events_result.get("ok") else profile_events_result.get("status", "skipped"),
         "source_table_count": bridge.get("source_table_count", 0),
+        "signal_context_digest": state.get("signal_context_digest") or {},
+        "prep_warnings": list(state.get("signal_context_warnings") or []),
     }
     state["prepared_signal_inputs"] = result
     return result
@@ -1481,6 +1551,238 @@ def _normalize_review_decision(review_payload: Dict[str, Any]) -> Dict[str, Any]
     return normalized
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _memory_bank_dir() -> Path:
+    return _repo_root() / "memory-bank"
+
+
+def _candidate_id() -> str:
+    return f"candidate_{uuid.uuid4().hex[:12]}"
+
+
+def _normalize_list_items(values: Any, limit: int = 6) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    items: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in items:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _find_candidate_record(state: Dict[str, Any], candidate_id: str) -> Optional[Dict[str, Any]]:
+    for item in state.get("candidate_signals") or []:
+        if isinstance(item, dict) and str(item.get("candidate_id") or "") == candidate_id:
+            return item
+    return None
+
+
+def _replace_candidate_record(state: Dict[str, Any], candidate_record: Dict[str, Any]) -> None:
+    candidate_id = str(candidate_record.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    items = state.setdefault("candidate_signals", [])
+    for idx, item in enumerate(items):
+        if isinstance(item, dict) and str(item.get("candidate_id") or "") == candidate_id:
+            items[idx] = candidate_record
+            return
+    items.append(candidate_record)
+
+
+def _compact_execution_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    rows = result.get("rows") or []
+    first_row = rows[0] if rows else None
+    return {
+        "ok": bool(result.get("ok")),
+        "row_count": int(result.get("row_count") or 0),
+        "returned_row_count": int(result.get("returned_row_count") or 0),
+        "cached": bool(result.get("cached")),
+        "columns": [str(col.get("name") or col.get("column_name") or "") for col in (result.get("columns") or [])[:8] if isinstance(col, dict)],
+        "sample_row": first_row if isinstance(first_row, (dict, list)) else {},
+    }
+
+
+def _candidate_semantic_basis(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": str(candidate.get("name") or "").strip().lower(),
+        "entity_grain": str(candidate.get("entity_grain") or "").strip().lower(),
+        "time_window": str(candidate.get("time_window") or "").strip().lower(),
+        "comparison_baseline": str(candidate.get("comparison_baseline") or "").strip().lower(),
+        "target_event": str(candidate.get("target_event") or "").strip().lower(),
+    }
+
+
+def _candidate_fingerprints(candidate: Dict[str, Any]) -> Dict[str, str]:
+    sql_value = _normalize_sql_value(str(candidate.get("query_template") or candidate.get("sql") or ""))
+    semantics = _candidate_semantic_basis(candidate)
+    return {
+        "sql": _stable_hash({"sql": sql_value}),
+        "semantics": _stable_hash(semantics),
+        "combined": _stable_hash({"sql": sql_value, **semantics}),
+    }
+
+
+def _fingerprint_lookup(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup = state.setdefault("candidate_fingerprints", {})
+    if isinstance(lookup, dict):
+        return lookup
+    repaired: Dict[str, Dict[str, Any]] = {}
+    state["candidate_fingerprints"] = repaired
+    return repaired
+
+
+def _collect_candidate_fingerprints_from_signal(signal: Dict[str, Any]) -> Dict[str, str]:
+    existing = signal.get("fingerprints")
+    if isinstance(existing, dict) and existing:
+        return {str(k): str(v) for k, v in existing.items() if str(v)}
+    return _candidate_fingerprints(signal)
+
+
+def _register_candidate_fingerprints(state: Dict[str, Any], candidate_record: Dict[str, Any]) -> None:
+    candidate_id = str(candidate_record.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    lookup = _fingerprint_lookup(state)
+    fingerprints = _collect_candidate_fingerprints_from_signal(candidate_record)
+    for fp_type, value in fingerprints.items():
+        if not value:
+            continue
+        lookup[value] = {
+            "candidate_id": candidate_id,
+            "fingerprint_type": fp_type,
+            "status": str(candidate_record.get("status") or ""),
+            "name": str(candidate_record.get("name") or ""),
+        }
+
+
+def _sync_candidate_compatibility_lists(state: Dict[str, Any]) -> None:
+    candidates = [item for item in (state.get("candidate_signals") or []) if isinstance(item, dict)]
+    state["candidate_hypotheses"] = [dict(item) for item in candidates]
+    execution_summaries = [item for item in (state.get("signal_execution_summaries") or []) if isinstance(item, dict)]
+    state["execution_summaries"] = [dict(item) for item in execution_summaries]
+
+
+def _build_candidate_record(candidate_payload: Dict[str, Any]) -> Dict[str, Any]:
+    record = dict(candidate_payload)
+    record.setdefault("candidate_id", _candidate_id())
+    record.setdefault("stored_at", _utc_now())
+    record.setdefault("status", "pending_review")
+    record.setdefault("review_status", "pending")
+    record["fingerprints"] = _candidate_fingerprints(record)
+    return record
+
+
+def _ensure_candidate_target_event(candidate_payload: Dict[str, Any], objective: Dict[str, Any]) -> None:
+    if candidate_payload.get("target_event"):
+        return
+    target_event = str(objective.get("success_event_name") or "").strip()
+    if target_event:
+        candidate_payload["target_event"] = target_event
+
+
+def _candidate_missing_fields(candidate_payload: Dict[str, Any]) -> List[str]:
+    required = (
+        "name",
+        "entity_grain",
+        "time_window",
+        "comparison_baseline",
+        "query_template",
+        "interpretation",
+    )
+    return [field for field in required if not str(candidate_payload.get(field) or "").strip()]
+
+
+def _append_signal_execution_summary(state: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    state.setdefault("signal_execution_summaries", []).append(payload)
+    _sync_candidate_compatibility_lists(state)
+
+
+def _safe_json_loads(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        loaded = json.loads(value)
+    except Exception:
+        return {}
+    return dict(loaded) if isinstance(loaded, dict) else {}
+
+
+def _append_unique_state_item(state: Dict[str, Any], key: str, payload: Dict[str, Any], dedupe_key: str = "") -> None:
+    items = state.setdefault(key, [])
+    if dedupe_key:
+        dedupe_value = str(payload.get(dedupe_key) or "")
+        if dedupe_value:
+            for item in items:
+                if isinstance(item, dict) and str(item.get(dedupe_key) or "") == dedupe_value:
+                    return
+    items.append(payload)
+
+
+def select_memory_bank_guides() -> List[Dict[str, Any]]:
+    return [
+        {"path": "monetization-pricing.md", "topics": ["value_metric", "expansion_revenue", "seat_expansion", "tier_upgrade", "ndr"]},
+        {"path": "cohort-retention-analysis.md", "topics": ["retention", "frequency", "power_users", "disengagement"]},
+        {"path": "rice-prioritization.md", "topics": ["reach", "impact", "confidence", "ranking"]},
+        {"path": "founding-sales.md", "topics": ["icp", "pain", "cost", "proof"]},
+        {"path": "running-lean.md", "topics": ["actionable_metrics", "vanity_metrics", "cohort_analysis"]},
+        {"path": "hypotheses-generation.md", "topics": ["icp", "pain", "cost", "proof"]},
+    ]
+
+
+def load_memory_bank_snippets(selected_guides: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    snippets: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    base_dir = _memory_bank_dir()
+    guides = selected_guides or select_memory_bank_guides()
+    if not base_dir.exists():
+        return {"snippets": [], "warnings": ["memory_bank_missing"]}
+    for guide in guides:
+        rel_path = str(guide.get("path") or "").strip()
+        if not rel_path:
+            continue
+        path = base_dir / rel_path
+        if not path.exists():
+            warnings.append(f"missing:{rel_path}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            warnings.append(f"unreadable:{rel_path}")
+            continue
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        heading = next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.stem.replace("-", "_"))
+        body_lines = [line for line in lines if not line.startswith("#")][:8]
+        content = " ".join(body_lines)
+        if len(content) > 420:
+            content = content[:417].rstrip() + "..."
+        topic = str((guide.get("topics") or ["general"])[0])
+        snippets.append(
+            {
+                "source": f"memory-bank/{rel_path}",
+                "topic": topic,
+                "content": f"{heading}: {content}".strip(),
+                "use_for": list(guide.get("topics") or [])[:4],
+            }
+        )
+    return {"snippets": snippets, "warnings": warnings}
+
+
+def build_signal_playbook_snippets() -> Dict[str, Any]:
+    loaded = load_memory_bank_snippets()
+    return {
+        "playbook_snippets": loaded.get("snippets") or [],
+        "warnings": loaded.get("warnings") or [],
+    }
+
+
 def _candidate_mentions_success_target(payload: Dict[str, Any], objective: Dict[str, Any]) -> bool:
     if str(objective.get("success_proxy_mode") or "").strip():
         return True
@@ -1518,6 +1820,154 @@ def _candidate_has_cohort_evidence(payload: Dict[str, Any]) -> bool:
     if any(marker in evidence for marker in required_markers):
         return True
     return bool(evidence.get("cohort_metrics"))
+
+
+def submit_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        payload = dict(candidate or {})
+        if isinstance(payload.get("promotion_evidence"), str):
+            payload["promotion_evidence"] = {"note": str(payload.get("promotion_evidence") or "").strip()}
+        payload.setdefault("parameter_set", {})
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        _ensure_candidate_target_event(payload, objective)
+        missing_fields = _candidate_missing_fields(payload)
+        if missing_fields:
+            state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "invalid_candidate",
+                "reason": f"missing required fields: {', '.join(missing_fields)}",
+                "violations": [f"missing_field:{field}" for field in missing_fields],
+                "rewrite_hints": ["Include all required candidate fields before submission."],
+            }
+        candidate_ok, validated_candidate = _safe_model_validate(CandidateSignalDraft, payload)
+        if not candidate_ok:
+            state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "invalid_candidate",
+                "reason": str(validated_candidate.get("detail") or "candidate validation failed"),
+                "violations": ["candidate_validation_error"],
+                "rewrite_hints": ["Match the expected candidate draft schema before retrying."],
+            }
+
+        record = _build_candidate_record(validated_candidate)
+        lookup = _fingerprint_lookup(state)
+        duplicate_match = None
+        for _, value in sorted(record.get("fingerprints", {}).items()):
+            existing = lookup.get(value)
+            if existing:
+                duplicate_match = existing
+                break
+        if duplicate_match:
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "duplicate",
+                "candidate_id": record.get("candidate_id"),
+                "reason": f"duplicate of {duplicate_match.get('candidate_id') or 'existing_signal'}",
+                "violations": ["duplicate_candidate"],
+                "rewrite_hints": ["Change the hypothesis, grain, time window, or SQL before retrying."],
+            }
+
+        policy = validate_sql_policy(str(record.get("query_template") or ""), tool_context=tool_context)
+        record["dedupe_result"] = {"is_duplicate": False}
+        record["policy_result"] = {
+            "allowed": bool(policy.get("allowed")),
+            "violations": list(policy.get("violations") or []),
+            "rewrite_hints": list(policy.get("rewrite_hints") or []),
+        }
+        if not policy.get("allowed"):
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "policy_blocked",
+                "candidate_id": record.get("candidate_id"),
+                "reason": "sql policy blocked candidate",
+                "violations": list(policy.get("violations") or []),
+                "rewrite_hints": list(policy.get("rewrite_hints") or []),
+            }
+
+        execution_result = run_readonly_query(
+            sql=str(record.get("query_template") or ""),
+            purpose=f"candidate_validation:{record.get('name') or record.get('candidate_id')}",
+            expected_grain=str(record.get("entity_grain") or ""),
+            session_id=str(state.get("session_id") or ""),
+            tool_context=tool_context,
+        )
+        if not execution_result.get("ok"):
+            return {
+                "ok": False,
+                "status": "query_failed",
+                "candidate_id": record.get("candidate_id"),
+                "reason": str(execution_result.get("error") or "query_failed"),
+                "violations": list(execution_result.get("violations") or []),
+                "rewrite_hints": list(execution_result.get("rewrite_hints") or []),
+            }
+
+        execution_summary = _compact_execution_summary(execution_result)
+        record["execution_outcome"] = {
+            "status": "ok",
+            "purpose": execution_result.get("purpose"),
+            "expected_grain": execution_result.get("expected_grain"),
+            "sql": execution_result.get("query"),
+            "row_count": int(execution_result.get("row_count") or 0),
+            "column_count": len(execution_result.get("columns") or []),
+            "cached": bool(execution_result.get("cached")),
+            "notes": "",
+        }
+        record["execution_evidence_summary"] = execution_summary
+        record["status"] = "pending_review"
+        record["review_status"] = "pending"
+
+        _replace_candidate_record(state, record)
+        _register_candidate_fingerprints(state, record)
+        state["last_candidate_signal_id"] = str(record.get("candidate_id") or "")
+        state["latest_pending_candidate_for_review"] = {
+            "candidate_id": record.get("candidate_id"),
+            "name": record.get("name"),
+            "entity_grain": record.get("entity_grain"),
+            "time_window": record.get("time_window"),
+            "comparison_baseline": record.get("comparison_baseline"),
+            "interpretation": record.get("interpretation"),
+            "target_event": record.get("target_event"),
+            "promotion_evidence": record.get("promotion_evidence"),
+            "execution_evidence_summary": execution_summary,
+            "query_template": record.get("query_template"),
+        }
+        _append_signal_execution_summary(
+            state,
+            {
+                "candidate_id": str(record.get("candidate_id") or ""),
+                "status": "ok",
+                "purpose": record["execution_outcome"].get("purpose"),
+                "expected_grain": record["execution_outcome"].get("expected_grain"),
+                "sql": record["execution_outcome"].get("sql"),
+                "row_count": int(record["execution_outcome"].get("row_count") or 0),
+                "column_count": int(record["execution_outcome"].get("column_count") or 0),
+                "cached": bool(record["execution_outcome"].get("cached")),
+                "notes": "",
+            },
+        )
+        _sync_candidate_compatibility_lists(state)
+        _record_artifact(state, "candidate_hypotheses", record, append=True)
+        _record_artifact(state, "execution_summaries", state["signal_execution_summaries"][-1], append=True)
+
+        return {
+            "ok": True,
+            "status": "pending_review",
+            "candidate_id": record.get("candidate_id"),
+            "dedupe": {"is_duplicate": False},
+            "policy": {"allowed": True},
+            "execution": {
+                "ok": True,
+                "row_count": int(execution_summary.get("row_count") or 0),
+                "evidence_summary": execution_summary,
+            },
+        }
+    except Exception as exc:
+        return _tool_exception("submit_candidate_signal", exc, state)
 
 
 def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
@@ -1573,7 +2023,15 @@ def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) 
             state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
             return validated
 
-        state.setdefault("candidate_hypotheses", []).append(validated)
+        candidate_record = _build_candidate_record(validated)
+        candidate_record["status"] = "promoted" if is_promoted else str(candidate_record.get("status") or "candidate")
+        if review_validated:
+            candidate_record["review_decision"] = review_validated
+            candidate_record["review_status"] = str(review_validated.get("decision") or "")
+        _replace_candidate_record(state, candidate_record)
+        _register_candidate_fingerprints(state, candidate_record)
+        state["last_candidate_signal_id"] = str(candidate_record.get("candidate_id") or "")
+        _sync_candidate_compatibility_lists(state)
         _record_artifact(state, "candidate_hypotheses", validated, append=True)
 
         if review_validated:
@@ -1584,6 +2042,8 @@ def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) 
         if isinstance(execution_payload, dict):
             exec_ok, exec_validated = _safe_model_validate(ExecutionOutcome, execution_payload)
             if exec_ok:
+                exec_validated["candidate_id"] = state.get("last_candidate_signal_id") or ""
+                state.setdefault("signal_execution_summaries", []).append(exec_validated)
                 state.setdefault("execution_summaries", []).append(exec_validated)
                 _record_artifact(state, "execution_summaries", exec_validated, append=True)
 
@@ -1611,6 +2071,9 @@ def load_existing_signals(tool_context: Any = None) -> Dict[str, Any]:
     state = _state_from_context(tool_context)
     promoted = state.get("promoted_signals") or []
     if promoted:
+        for signal in promoted:
+            if isinstance(signal, dict):
+                _register_candidate_fingerprints(state, signal)
         return {"ok": True, "count": len(promoted), "signals": promoted}
     run_dir = _run_dir(state)
     path = run_dir / "promoted_signal_specs.jsonl"
@@ -1626,7 +2089,80 @@ def load_existing_signals(tool_context: Any = None) -> Dict[str, Any]:
         except Exception:
             continue
     state["promoted_signals"] = signals
+    for signal in signals:
+        if isinstance(signal, dict):
+            _register_candidate_fingerprints(state, signal)
     return {"ok": True, "count": len(signals), "signals": signals}
+
+
+def apply_latest_review_decision_to_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        review_payload = _safe_json_loads(state.get("signal_reviewer_iteration"))
+        if not review_payload:
+            return {"ok": True, "status": "no_review_payload"}
+        candidate_id = str(review_payload.get("candidate_id") or state.get("last_candidate_signal_id") or "").strip()
+        if not candidate_id:
+            return {"ok": True, "status": "missing_candidate_id"}
+        apply_key = f"{candidate_id}:{_stable_hash(review_payload)}"
+        applied_keys = state.setdefault("review_applied_keys", [])
+        if apply_key in applied_keys:
+            return {"ok": True, "status": "already_applied", "candidate_id": candidate_id}
+        candidate_record = _find_candidate_record(state, candidate_id)
+        if candidate_record is None:
+            return {"ok": True, "status": "candidate_not_found", "candidate_id": candidate_id}
+
+        normalized_review = _normalize_review_decision(review_payload)
+        normalized_review["candidate_id"] = candidate_id
+        if "confidence" in review_payload:
+            normalized_review["confidence"] = _coerce_float(review_payload.get("confidence"), 0.0)
+        review_ok, review_validated = _safe_model_validate(ReviewDecision, normalized_review)
+        review_entry = review_validated if review_ok else normalized_review
+
+        decision = str(review_entry.get("decision") or "reject").lower()
+        promotion_ready = bool(review_entry.get("promotion_readiness"))
+        is_promoted = decision == "approve" and promotion_ready
+
+        candidate_record["review_decision"] = review_entry
+        candidate_record["review_status"] = decision
+        candidate_record["review_applied_at"] = _utc_now()
+        candidate_record["status"] = "promoted" if is_promoted else "rejected"
+        candidate_record["promoted"] = is_promoted
+        _replace_candidate_record(state, candidate_record)
+        _register_candidate_fingerprints(state, candidate_record)
+        state["latest_pending_candidate_for_review"] = {}
+        _append_unique_state_item(state, "review_decisions", review_entry, dedupe_key="candidate_id")
+        _record_artifact(state, "review_decisions", review_entry, append=True)
+
+        if is_promoted:
+            promoted_payload = {
+                **candidate_record,
+                "promoted": True,
+                "status": "promoted",
+            }
+            promoted_ok, promoted_validated = _safe_model_validate(PromotedSignal, promoted_payload)
+            if promoted_ok:
+                _append_unique_state_item(state, "promoted_signals", promoted_validated, dedupe_key="candidate_id")
+                _record_artifact(state, "promoted_signal_specs", promoted_validated, append=True)
+        else:
+            rejection_payload = {
+                "candidate_id": candidate_id,
+                "status": "rejected",
+                "reasons": _normalize_list_items(review_entry.get("reasons"), limit=8),
+                "required_fixes": _normalize_list_items(review_entry.get("required_fixes"), limit=8),
+            }
+            _append_unique_state_item(state, "rejected_signals", rejection_payload, dedupe_key="candidate_id")
+
+        applied_keys.append(apply_key)
+        state["last_applied_review_candidate_id"] = candidate_id
+        _sync_candidate_compatibility_lists(state)
+        _record_artifact(state, "candidate_hypotheses", candidate_record, append=True)
+        return {
+            "ok": True,
+            "status": candidate_record.get("status"),
+            "candidate_id": candidate_id,
+        }
+    except Exception as exc:
+        return _tool_exception("apply_latest_review_decision_to_state", exc, state)
 
 
 def store_warehouse_profile(profile: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
@@ -1711,7 +2247,7 @@ def store_warehouse_profile(profile: Dict[str, Any], tool_context: Any = None) -
 def dedupe_candidate(sql_or_semantics: str, tool_context: Any = None) -> Dict[str, Any]:
     state = _state_from_context(tool_context)
     normalized = _normalize_sql_value(sql_or_semantics)
-    existing = state.get("candidate_hypotheses") or []
+    existing = state.get("candidate_signals") or state.get("candidate_hypotheses") or []
     duplicates = []
     for idx, item in enumerate(existing):
         if not isinstance(item, dict):
@@ -1939,10 +2475,10 @@ def finalize_experiment_report(holdout_shift_days: int = 14, tool_context: Any =
             return result
 
         rerun = rerun_promoted_signals(holdout_shift_days=holdout_shift_days, tool_context=tool_context)
-        candidates = state.get("candidate_hypotheses") or []
+        candidates = state.get("candidate_signals") or state.get("candidate_hypotheses") or []
         policy_validations = state.get("policy_validations") or []
         reviews = state.get("review_decisions") or []
-        executions = state.get("execution_summaries") or []
+        executions = state.get("signal_execution_summaries") or state.get("execution_summaries") or []
         promoted = state.get("promoted_signals") or []
         rerun_results = state.get("holdout_rerun_results") or []
         loop_events = state.get("loop_iteration_events") or []

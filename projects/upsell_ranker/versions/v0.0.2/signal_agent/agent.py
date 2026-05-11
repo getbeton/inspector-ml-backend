@@ -12,14 +12,10 @@ except Exception:  # pragma: no cover - runtime compatibility guard
     _ResourceExhaustedError = Exception
 
 from .tools import (
-    dedupe_candidate,
+    apply_latest_review_decision_to_state,
     finalize_experiment_report,
-    get_signal_objective_compact,
-    get_warehouse_profile_compact,
-    load_existing_signals,
     prepare_signal_inputs,
-    run_readonly_query,
-    store_candidate_signal,
+    submit_candidate_signal,
     validate_sql_policy,
 )
 
@@ -44,6 +40,7 @@ class ScopedLoopAgent(LoopAgent):
         state = getattr(getattr(ctx, "session", None), "state", None)
         if state is None:
             return False
+        apply_latest_review_decision_to_state(state)
         limits = state.get("loop_limits") or {}
         max_iterations = int(limits.get("max_iterations") or os.getenv("SIGNAL_AGENT_MAX_ITERATIONS", "8"))
         target_promoted = int(limits.get("target_promoted_signals") or os.getenv("SIGNAL_AGENT_TARGET_PROMOTED", "3"))
@@ -174,6 +171,37 @@ def signal_before_tool_callback(*args: Any, **kwargs: Any) -> Any:
     }
 
 
+def signal_tool_not_found_callback(*args: Any, **kwargs: Any) -> Any:
+    # ADK raises ValueError("Tool '<name>' not found.\nAvailable tools: ...") from
+    # _get_tool when an LLM hallucinates a function name. Return a structured
+    # function_response so the loop can continue instead of 500-ing the whole /run.
+    # Use *args/**kwargs to stay compatible across ADK callback signatures
+    # (current ADK invokes this as callback(tool=..., args=..., tool_context=..., error=...)).
+    tool = kwargs.get("tool") if "tool" in kwargs else (args[0] if args else None)
+    error = kwargs.get("error")
+    if error is None:
+        for a in args[1:]:
+            if isinstance(a, Exception):
+                error = a
+                break
+    if not isinstance(error, ValueError):
+        return None
+    tool_name = getattr(tool, "name", "") or ""
+    if not str(error).startswith(f"Tool '{tool_name}' not found."):
+        return None
+    return {
+        "ok": False,
+        "error": "tool_not_available_in_this_stage",
+        "tool_name": tool_name,
+        "hint": (
+            "This tool is not registered on the current agent. Re-read the agent "
+            "instruction for the allowed tool list and call only an allowed tool. "
+            "Do not invent finalize/terminate tools - the loop controller exits "
+            "deterministically once limits or promotion targets are met."
+        ),
+    }
+
+
 def _llm_kwargs(output_key: str = "") -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     try:
@@ -184,6 +212,12 @@ def _llm_kwargs(output_key: str = "") -> Dict[str, Any]:
         kwargs["before_tool_callback"] = signal_before_tool_callback
     if output_key and "output_key" in sig.parameters:
         kwargs["output_key"] = output_key
+    # on_tool_error_callback is a pydantic model field; LlmAgent.__init__ is the
+    # generated pydantic constructor so inspect.signature.parameters is empty.
+    # Check model_fields directly so the callback actually gets attached.
+    model_fields = getattr(LlmAgent, "model_fields", None) or {}
+    if "on_tool_error_callback" in model_fields:
+        kwargs["on_tool_error_callback"] = signal_tool_not_found_callback
     return kwargs
 
 
@@ -212,15 +246,7 @@ signal_prep_agent = LlmAgent(
 explorer_agent = LlmAgent(
     name="signal_explorer_agent",
     model=MODEL,
-    tools=[
-        load_existing_signals,
-        get_warehouse_profile_compact,
-        get_signal_objective_compact,
-        dedupe_candidate,
-        store_candidate_signal,
-        validate_sql_policy,
-        run_readonly_query,
-    ],
+    tools=[submit_candidate_signal],
     **_llm_kwargs(output_key="signal_explorer_iteration"),
     instruction=(
         "You are the Explorer in a two-LLM signal discovery loop.\n"
@@ -253,40 +279,39 @@ explorer_agent = LlmAgent(
         "- For recent vs baseline comparisons, use a single SELECT with conditional aggregation.\n"
         "- Do not call schema discovery tools in this stage; bootstrap already handled schema discovery.\n"
         "- Do not spend query budget on rediscovery checks such as top events, date range scans, event existence checks, or generic top pages.\n"
-        "- The single run_readonly_query call must validate the current candidate hypothesis itself.\n"
         "- Never emit prose like 'I will now...' or 'the experiment is complete'. Return compact JSON only.\n"
         "\n"
         "Window priors:\n"
         "- event-path precursors should be tested in both same-session and 7-day lookback windows;\n"
         "- include cohort discrimination evidence (success vs failure vs grey) in promotion_evidence.\n"
         "\n"
+        "State available to you:\n"
+        "- signal_context_digest contains compact objective, warehouse constraints, existing signal fingerprints, loop limits, and playbook snippets.\n"
+        "- candidate_signals and review_decisions contain prior in-run attempts.\n"
+        "\n"
         "Workflow each iteration:\n"
-        "1) Call get_signal_objective_compact and get_warehouse_profile_compact first.\n"
-        "   If success_proxy_mode is present, treat success_event_name as a conversion proxy label rather than a literal event that must exist in the events table.\n"
-        "2) Load existing signals.\n"
-        "3) Use prior stored candidates/reviews to avoid repeating the same hypothesis.\n"
-        "4) Propose one candidate hypothesis tied to success_event_name.\n"
-        "5) Produce query_template + parameter_set + rationale.\n"
-        "6) Include target_event and cohort evidence fields in candidate.\n"
-        "7) If prior iterations failed or had zero evidence, change the hypothesis rather than restating it.\n"
-        "8) Do not attempt to terminate the loop yourself; just complete one iteration.\n"
-        "9) Call dedupe_candidate.\n"
-        "10) Call validate_sql_policy.\n"
-        "11) If policy allows, call run_readonly_query once.\n"
-        "12) Call store_candidate_signal with full candidate draft.\n"
+        "1) Read signal_context_digest from session state before drafting.\n"
+        "2) Propose exactly one candidate hypothesis tied to success_event_name or an allowed success proxy.\n"
+        "3) Produce query_template + parameter_set + rationale.\n"
+        "4) Include target_event and cohort evidence fields in candidate.\n"
+        "5) If prior iterations failed or had zero evidence, change the hypothesis rather than restating it.\n"
+        "6) Call submit_candidate_signal exactly once with the full candidate draft.\n"
+        "7) Do not call schema discovery, dedupe, SQL validation, query execution, or storage tools directly.\n"
+        "8) If submit_candidate_signal returns duplicate, policy_blocked, query_failed, or invalid_candidate, return compact JSON that acknowledges the status and what should change next iteration.\n"
+        "9) Do not attempt to terminate the loop yourself; just complete one iteration.\n"
         "\n"
         "Candidate fields must include:\n"
         "name, entity_grain, time_window, comparison_baseline, query_template,\n"
         "parameter_set, interpretation, promotion_evidence, target_event, status.\n"
         "promotion_evidence must always be a JSON object, never a string.\n"
-        "After store_candidate_signal, return only compact ack JSON with candidate name, status, and stored_as when available.\n"
+        "After submit_candidate_signal, return only compact ack JSON.\n"
     ),
 )
 
 reviewer_agent = LlmAgent(
     name="signal_reviewer_agent",
     model=REVIEWER_MODEL,
-    tools=[get_signal_objective_compact, store_candidate_signal],
+    tools=[],
     **_llm_kwargs(output_key="signal_reviewer_iteration"),
     instruction=(
         "You are the Reviewer in a two-LLM loop.\n"
@@ -308,14 +333,15 @@ reviewer_agent = LlmAgent(
         "- Deterministic policy tools are ultimate safety authority.\n"
         "- Never emit narrative prose or completion summaries. Return compact JSON only.\n"
         "\n"
+        "State available to you:\n"
+        "- signal_context_digest contains compact objective, warehouse constraints, and playbook snippets.\n"
+        "- latest_pending_candidate_for_review contains the latest pending candidate, including compact execution evidence.\n"
+        "\n"
         "Workflow:\n"
-        "1) Call get_signal_objective_compact to load success/failure priors.\n"
-        "   If success_proxy_mode is present, interpret success_event_name as a proxy conversion label rather than a required literal event.\n"
-        "2) Build ReviewDecision JSON with decision=approve|reject and promotion_readiness boolean.\n"
-        "3) Call store_candidate_signal once with candidate + review_decision.\n"
-        "4) Set promoted=true,status=promoted only when candidate is reusable and execution evidence is meaningful.\n"
-        "5) Do not attempt to terminate the loop; only review the current candidate.\n"
-        "6) Return concise ack JSON with decision, promoted flag, and stored_as when available.\n"
+        "1) Read signal_context_digest and latest_pending_candidate_for_review from session state.\n"
+        "2) Review the latest pending candidate only.\n"
+        "3) Return JSON only with candidate_id, decision, promotion_readiness, reasons, required_fixes, and confidence.\n"
+        "4) Do not persist anything yourself and do not attempt to terminate the loop.\n"
     ),
 )
 
