@@ -18,6 +18,7 @@ from .tools import (
     submit_candidate_signal,
     validate_sql_policy,
 )
+from shared.skills import build_skill_toolset
 
 AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
 if AGENTOPS_API_KEY:
@@ -27,6 +28,15 @@ MODEL = build_gemini("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview")
 REVIEWER_MODEL = build_gemini(
     "SIGNAL_REVIEWER_MODEL",
     os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"),
+)
+
+_SKILL_TOOLSET = build_skill_toolset()
+_SKILL_TOOLS: list[Any] = [_SKILL_TOOLSET] if _SKILL_TOOLSET is not None else []
+_SKILL_INSTRUCTION = (
+    "You have access to expert skill tools (list_skills, load_skill, load_skill_resource).\n"
+    "Before designing a new hypothesis, prioritization, or review heuristic, call list_skills\n"
+    "once and load any directly relevant skill before drafting. Do not load the same skill\n"
+    "more than once per iteration.\n\n"
 )
 
 
@@ -246,9 +256,10 @@ signal_prep_agent = LlmAgent(
 explorer_agent = LlmAgent(
     name="signal_explorer_agent",
     model=MODEL,
-    tools=[submit_candidate_signal],
+    tools=[submit_candidate_signal, *_SKILL_TOOLS],
     **_llm_kwargs(output_key="signal_explorer_iteration"),
     instruction=(
+        _SKILL_INSTRUCTION +
         "You are the Explorer in a two-LLM signal discovery loop.\n"
         "\n"
         "Mission:\n"
@@ -311,9 +322,10 @@ explorer_agent = LlmAgent(
 reviewer_agent = LlmAgent(
     name="signal_reviewer_agent",
     model=REVIEWER_MODEL,
-    tools=[],
+    tools=[*_SKILL_TOOLS],
     **_llm_kwargs(output_key="signal_reviewer_iteration"),
     instruction=(
+        _SKILL_INSTRUCTION +
         "You are the Reviewer in a two-LLM loop.\n"
         "Review Explorer candidate for safety semantics, schema plausibility, grain clarity,\n"
         "temporal logic, nontriviality, and rerunnability.\n"
@@ -359,9 +371,10 @@ discovery_loop_agent = ScopedLoopAgent(
 finalize_agent = LlmAgent(
     name="signal_finalize_agent",
     model=MODEL,
-    tools=[finalize_experiment_report],
+    tools=[finalize_experiment_report, *_SKILL_TOOLS],
     **_llm_kwargs(output_key="signal_final_report"),
     instruction=(
+        _SKILL_INSTRUCTION +
         "You are the finalization stage.\n"
         "Call finalize_experiment_report exactly once.\n"
         "Return JSON with report metrics and summary_path only.\n"
