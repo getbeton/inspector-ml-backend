@@ -142,3 +142,18 @@ TELEGRAM_DB_PASSWORD=
 - Generated artifacts, caches, logs, and local report outputs are intentionally ignored.
 - Version-specific details live in each project and version README.
 - Public docs use "warehouse" in place of internal shorthand such as "DWH" on first mention.
+
+
+---
+
+## About
+
+This backend is part of [Beton](https://www.getbeton.ai/), open-source revenue intelligence. The agent it powers is described at [getbeton.ai](https://www.getbeton.ai/), and its native data integrations are documented at [getbeton.ai/integrations](https://www.getbeton.ai/integrations/).
+
+Related Beton open-source tools:
+
+- [Inspector](https://github.com/getbeton/inspector) — the front-end agent + workspace this backend serves
+- [DryFit](https://www.getbeton.ai/oss-tools/dryfit/) — synthetic analytics datasets for agent benchmarking
+- [openclaw-gtm-skills](https://www.getbeton.ai/oss-tools/openclaw-gtm-skills/) — company research pipeline for OpenClaw
+
+Browse [all open-source tools by Beton →](https://www.getbeton.ai/oss-tools/)
