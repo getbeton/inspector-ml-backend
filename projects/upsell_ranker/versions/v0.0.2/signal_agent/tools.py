@@ -1,0 +1,2511 @@
+"""Read-only signal discovery helpers with caching, policy checks, and artifacts."""
+
+import json
+import hashlib
+import os
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import ValidationError
+from shared.cache import cache_read_json, cache_write_json
+from shared.inspector import inspector_env, inspector_get, inspector_post
+
+from .models import (
+    CandidateSignalDraft,
+    ExecutionOutcome,
+    ExperimentReport,
+    PromotedSignal,
+    ReviewDecision,
+    SignalObjective,
+    WarehouseProfile,
+)
+
+POLICY_VERSION = "v0.0.2"
+BLOCKED_SQL_PATTERNS = (
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "alter",
+    "create",
+    "truncate",
+    "grant",
+    "revoke",
+    "merge",
+    "attach",
+    "detach",
+    "optimize",
+)
+BLOCKED_SQL_REGEX_PATTERNS = (
+    (r"\bunion\b", "union_not_allowed"),
+    (r"\bcast\s*\(", "cast_not_allowed"),
+    (r"\bcross\s+join\b", "cross_join_not_allowed"),
+    (r"\binto\s+outfile\b", "into_outfile_not_allowed"),
+    (r"\bload_file\s*\(", "load_file_not_allowed"),
+    # PostHog HogQL doesn't implement SelectStmt.settingsClause; the proxy 400s
+    # before the agent ever sees results. Catch it client-side.
+    (r"\bsettings\s+\w+\s*=", "settings_clause_not_allowed"),
+)
+BLOCKED_FUNCTION_PATTERNS = (
+    "url",
+    "remote",
+    "remotesecure",
+    "cluster",
+    "clusterallreplicas",
+    "file",
+    "input",
+    "sleep",
+    "sleepeachrow",
+    "numbers",
+    "numbers_mt",
+    "generaterandom",
+    "zeros",
+    "zeros_mt",
+    "arrayjoin",
+)
+BLOCKED_TABLE_PREFIXES = (
+    "system.",
+    "information_schema.",
+)
+STATE_LIST_KEYS = (
+    "candidate_hypotheses",
+    "sql_attempts",
+    "policy_validations",
+    "review_decisions",
+    "execution_summaries",
+    "promoted_signals",
+    "holdout_rerun_results",
+    "loop_iteration_events",
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _to_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _resolve_int_setting(value: Any, env_name: str, default: int) -> int:
+    try:
+        if value not in (None, "", 0, "0"):
+            return int(value)
+    except Exception:
+        pass
+    return _to_int_env(env_name, default)
+
+
+def _artifact_base_dir() -> Path:
+    override = os.getenv("SIGNAL_AGENT_ARTIFACT_DIR", "").strip()
+    if override:
+        path = Path(override).expanduser().resolve()
+    else:
+        path = Path(__file__).resolve().parent / "artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _run_id_from_state(state: Dict[str, Any]) -> str:
+    run_id = str(state.get("signal_run_id") or "").strip()
+    if run_id:
+        return run_id
+    run_id = f"run_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    state["signal_run_id"] = run_id
+    return run_id
+
+
+def _run_dir(state: Dict[str, Any]) -> Path:
+    run_id = _run_id_from_state(state)
+    path = _artifact_base_dir() / run_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True))
+        f.write("\n")
+
+
+def _state_from_context(tool_context: Any) -> Dict[str, Any]:
+    if tool_context is None:
+        return {}
+    state = getattr(tool_context, "state", None)
+    if state is None:
+        return {}
+    for key in STATE_LIST_KEYS:
+        state.setdefault(key, [])
+    state.setdefault("allowed_tables", [])
+    state.setdefault("warehouse_profile", {})
+    state.setdefault("signal_objective", {})
+    state.setdefault("latest_event_profile", {})
+    state.setdefault("tool_call_cache", {})
+    state.setdefault("last_loop_status", {})
+    state.setdefault("signal_context_digest", {})
+    state.setdefault("candidate_signals", [])
+    state.setdefault("candidate_fingerprints", {})
+    state.setdefault("signal_execution_summaries", [])
+    state.setdefault("rejected_signals", [])
+    state.setdefault("last_candidate_signal_id", "")
+    state.setdefault("latest_pending_candidate_for_review", {})
+    state.setdefault("review_applied_keys", [])
+    state.setdefault("last_applied_review_candidate_id", "")
+    return state
+
+
+def _stable_hash(payload: Dict[str, Any]) -> str:
+    try:
+        raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:
+        raw = repr(payload)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _tool_cache_key(tool_name: str, args_payload: Dict[str, Any]) -> str:
+    return f"{tool_name}:{_stable_hash(args_payload)}"
+
+
+def _tool_cache_get(state: Dict[str, Any], tool_name: str, args_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cache = state.get("tool_call_cache")
+    if not isinstance(cache, dict):
+        return None
+    key = _tool_cache_key(tool_name, args_payload)
+    cached = cache.get(key)
+    if not isinstance(cached, dict):
+        return None
+    result = dict(cached)
+    result["cached_call"] = True
+    return result
+
+
+def _tool_cache_set(state: Dict[str, Any], tool_name: str, args_payload: Dict[str, Any], result: Dict[str, Any]) -> None:
+    cache = state.setdefault("tool_call_cache", {})
+    if not isinstance(cache, dict) or not isinstance(result, dict):
+        return
+    key = _tool_cache_key(tool_name, args_payload)
+    cache[key] = dict(result)
+
+
+def _tool_exception(tool_name: str, exc: Exception, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "ok": False,
+        "error": "tool_exception",
+        "tool_name": tool_name,
+        "detail": str(exc),
+        "at": _utc_now(),
+    }
+    if isinstance(state, dict):
+        state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+        try:
+            _record_artifact(state, "tool_errors", payload, append=True)
+        except Exception:
+            pass
+    return payload
+
+
+def _truncate_rows_for_llm(rows: List[Any]) -> List[Any]:
+    max_rows = _to_int_env("SIGNAL_AGENT_LLM_ROW_RETURN_LIMIT", 4)
+    return list(rows[: max(1, max_rows)])
+
+
+def _session_id_arg(session_id: str, state: Dict[str, Any]) -> str:
+    provided = (session_id or "").strip()
+    if provided:
+        state["session_id"] = provided
+        return provided
+    existing = str(state.get("session_id") or "").strip()
+    return existing
+
+
+def _record_artifact(state: Dict[str, Any], name: str, payload: Dict[str, Any], append: bool) -> None:
+    if not state:
+        return
+    run_dir = _run_dir(state)
+    if append:
+        _append_jsonl(run_dir / f"{name}.jsonl", payload)
+    else:
+        _write_json(run_dir / f"{name}.json", payload)
+
+
+def initialize_signal_run(
+    session_id: str = "",
+    max_iterations: int = 0,
+    target_promoted_signals: int = 0,
+    too_many_failures: int = 0,
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        resolved_max_iterations = _resolve_int_setting(max_iterations, "SIGNAL_AGENT_MAX_ITERATIONS", 8)
+        resolved_target_promoted = _resolve_int_setting(target_promoted_signals, "SIGNAL_AGENT_TARGET_PROMOTED", 3)
+        resolved_too_many_failures = _resolve_int_setting(too_many_failures, "SIGNAL_AGENT_MAX_FAILURES", 5)
+        args_payload = {
+            "session_id": (session_id or "").strip(),
+            "max_iterations": resolved_max_iterations,
+            "target_promoted_signals": resolved_target_promoted,
+            "too_many_failures": resolved_too_many_failures,
+        }
+        cached = _tool_cache_get(state, "initialize_signal_run", args_payload)
+        if cached is not None:
+            return cached
+        sid = _session_id_arg(session_id, state)
+        state["signal_run_id"] = f"run_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        for key in STATE_LIST_KEYS:
+            state[key] = []
+        state["allowed_tables"] = []
+        state["schema_snapshot"] = {}
+        state["warehouse_profile"] = {}
+        state["signal_objective"] = {}
+        state["latest_event_profile"] = {}
+        state["signal_context_digest"] = {}
+        state["candidate_signals"] = []
+        state["candidate_fingerprints"] = {}
+        state["signal_execution_summaries"] = []
+        state["rejected_signals"] = []
+        state["last_candidate_signal_id"] = ""
+        state["latest_pending_candidate_for_review"] = {}
+        state["review_applied_keys"] = []
+        state["last_applied_review_candidate_id"] = ""
+        state["query_count"] = 0
+        state["failure_count"] = 0
+        state["non_query_failure_count"] = 0
+        state["iteration_index"] = 0
+        state["last_loop_status"] = {}
+        state["tool_call_cache"] = {}
+        state["loop_limits"] = {
+            "max_iterations": resolved_max_iterations,
+            "target_promoted_signals": resolved_target_promoted,
+            "too_many_failures": resolved_too_many_failures,
+        }
+        run_id = str(state["signal_run_id"])
+        payload = {
+            "ok": True,
+            "run_id": run_id,
+            "session_id": sid,
+            "loop_limits": state["loop_limits"],
+            "created_at": _utc_now(),
+        }
+        _record_artifact(state, "run_meta", payload, append=False)
+        _tool_cache_set(state, "initialize_signal_run", args_payload, payload)
+        return payload
+    except Exception as exc:
+        return _tool_exception("initialize_signal_run", exc, state)
+
+
+def _extract_table_names(list_tables_payload: Dict[str, Any]) -> List[str]:
+    raw_tables = list_tables_payload.get("tables") or []
+    names: List[str] = []
+    for table in raw_tables:
+        if not isinstance(table, dict):
+            continue
+        table_name = (
+            table.get("queryable_name")
+            or table.get("table_name")
+            or table.get("name")
+            or table.get("table_id")
+        )
+        if table_name:
+            names.append(str(table_name))
+    return names
+
+
+def list_tables(session_id: str = "", max_tables: int = 80, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    sid = _session_id_arg(session_id, state)
+    if not sid:
+        return {"ok": False, "error": "missing_session_id"}
+    env = inspector_env()
+    if not env["agent_secret"]:
+        return {"ok": False, "error": "missing_inspector_agent_secret"}
+    cache_key = f"signal_list_tables:v1:session_id={sid}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        tables_payload = cached
+        cached_hit = True
+    else:
+        try:
+            tables_payload = inspector_get(
+                env["url"],
+                "/api/agent/list-tables",
+                env["agent_secret"],
+                env["vercel_protection"],
+                params={"session_id": sid},
+                timeout=60,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": "list_tables_failed", "detail": str(exc)}
+        cache_write_json(cache_key, tables_payload)
+        cached_hit = False
+    table_names = _extract_table_names(tables_payload)[: max(1, int(max_tables))]
+    state["allowed_tables"] = sorted(set(table_names))
+    snapshot = {
+        "captured_at": _utc_now(),
+        "tables_raw": tables_payload.get("tables") or [],
+        "table_names": state["allowed_tables"],
+    }
+    state["schema_snapshot"] = snapshot
+    _record_artifact(state, "schema_snapshot", snapshot, append=False)
+    return {
+        "ok": True,
+        "cached": cached_hit,
+        "table_count": len(table_names),
+        "tables": table_names,
+    }
+
+
+def describe_table(table_name: str, session_id: str = "", sample_columns: int = 40, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    sid = _session_id_arg(session_id, state)
+    table_name = (table_name or "").strip()
+    if not table_name:
+        return {"ok": False, "error": "missing_table_name"}
+    if not sid:
+        return {"ok": False, "error": "missing_session_id"}
+    env = inspector_env()
+    if not env["agent_secret"]:
+        return {"ok": False, "error": "missing_inspector_agent_secret"}
+    cache_key = f"signal_describe_table:v1:session_id={sid}:table={table_name}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        columns_payload = cached
+        cached_hit = True
+    else:
+        try:
+            columns_payload = inspector_get(
+                env["url"],
+                "/api/agent/list-columns",
+                env["agent_secret"],
+                env["vercel_protection"],
+                params={"session_id": sid, "table_id": table_name},
+                timeout=60,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": "describe_table_failed", "detail": str(exc)}
+        cache_write_json(cache_key, columns_payload)
+        cached_hit = False
+    columns = (columns_payload.get("columns") or [])[: max(1, int(sample_columns))]
+    schema_snapshot = state.get("schema_snapshot") or {}
+    table_details = schema_snapshot.get("table_details") if isinstance(schema_snapshot, dict) else None
+    if not isinstance(table_details, dict):
+        table_details = {}
+    table_details[table_name] = {"columns": columns, "captured_at": _utc_now()}
+    if isinstance(schema_snapshot, dict):
+        schema_snapshot["table_details"] = table_details
+        state["schema_snapshot"] = schema_snapshot
+        _record_artifact(state, "schema_snapshot", schema_snapshot, append=False)
+    return {
+        "ok": True,
+        "cached": cached_hit,
+        "table_name": table_name,
+        "column_count": len(columns_payload.get("columns") or []),
+        "columns": columns,
+    }
+
+
+def _normalize_sql_value(sql: str) -> str:
+    normalized = re.sub(r"\s+", " ", (sql or "").strip())
+    return normalized.rstrip(";").strip()
+
+
+def normalize_sql(sql: str) -> Dict[str, Any]:
+    return {"ok": True, "normalized_sql": _normalize_sql_value(sql)}
+
+
+def _extract_referenced_tables(sql: str) -> List[str]:
+    # Approximate extraction for FROM/JOIN clauses.
+    tokens = re.findall(r"\b(?:from|join)\s+([`\"\[]?[a-zA-Z0-9_.-]+[`\"\]]?)", sql, flags=re.IGNORECASE)
+    tables: List[str] = []
+    for token in tokens:
+        cleaned = token.strip().strip("`").strip('"').strip("[").strip("]")
+        if cleaned:
+            tables.append(cleaned)
+    return sorted(set(tables))
+
+
+def _extract_cte_names(sql: str) -> List[str]:
+    names = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(", sql, flags=re.IGNORECASE)
+    return sorted({name.lower() for name in names})
+
+
+def _detect_risky_person_join(sql: str) -> List[str]:
+    violations: List[str] = []
+    compact = re.sub(r"\s+", " ", (sql or "").lower())
+    # Inspector/PostHog commonly stores events.distinct_id as String and persons.id as UUID.
+    # This join often fails with "no_common_type".
+    if re.search(r"\bjoin\s+persons\b", compact) and re.search(
+        r"\bon\s+[^=]*\bdistinct_id\b\s*=\s*[^=]*\bpersons?\b\.\bid\b", compact
+    ):
+        violations.append("risky_join_events_distinct_id_to_persons_id")
+    if re.search(r"\bjoin\s+persons\b", compact) and re.search(
+        r"\bon\s+[^=]*\bpersons?\b\.\bid\b\s*=\s*[^=]*\bdistinct_id\b", compact
+    ):
+        violations.append("risky_join_persons_id_to_events_distinct_id")
+    return violations
+
+
+def _has_case_without_else(sql: str) -> bool:
+    compact = re.sub(r"\s+", " ", (sql or "").lower())
+    # Prevent Inspector runtime failure: CASE without ELSE often compiles to multiIf with too few args.
+    return bool(re.search(r"\bcase\b[\s\S]*?\bwhen\b[\s\S]*?\bthen\b(?![\s\S]*?\belse\b)[\s\S]*?\bend\b", compact))
+
+
+def _has_case_expression(sql: str) -> bool:
+    return bool(re.search(r"\bcase\b", (sql or "").lower()))
+
+
+def _enforce_limit(sql: str, max_rows: int) -> Tuple[str, bool, Optional[int]]:
+    match = re.search(r"\blimit\s+(\d+)\b", sql, flags=re.IGNORECASE)
+    if not match:
+        return f"{sql.rstrip()} LIMIT {max_rows}", True, None
+    raw_limit = int(match.group(1))
+    if raw_limit <= max_rows:
+        return sql, False, raw_limit
+    enforced = re.sub(r"\blimit\s+\d+\b", f"LIMIT {max_rows}", sql, count=1, flags=re.IGNORECASE)
+    return enforced, True, raw_limit
+
+
+def validate_sql_policy(sql: str, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    max_len = _to_int_env("SIGNAL_AGENT_SQL_MAX_LEN", 12_000)
+    max_rows = _to_int_env("SIGNAL_AGENT_MAX_ROWS", 200)
+    normalized_sql = _normalize_sql_value(sql)
+    lower = normalized_sql.lower()
+    violations: List[str] = []
+
+    if not normalized_sql:
+        violations.append("empty_sql")
+    if len(normalized_sql) > max_len:
+        violations.append("query_too_long")
+    if ";" in normalized_sql:
+        violations.append("multi_statement_not_allowed")
+    if re.search(r"--|/\*|\*/|#", normalized_sql):
+        violations.append("comments_not_allowed")
+    if not (lower.startswith("select ") or lower.startswith("with ")):
+        violations.append("must_start_with_select_or_with")
+    if re.search(r";\s*\S", normalized_sql):
+        violations.append("multi_statement_not_allowed")
+    for keyword in BLOCKED_SQL_PATTERNS:
+        if re.search(rf"\b{re.escape(keyword)}\b", lower):
+            violations.append(f"blocked_keyword:{keyword}")
+    for pattern, label in BLOCKED_SQL_REGEX_PATTERNS:
+        if re.search(pattern, lower, flags=re.IGNORECASE):
+            violations.append(label)
+    for func in BLOCKED_FUNCTION_PATTERNS:
+        if re.search(rf"\b{re.escape(func)}\s*\(", lower):
+            violations.append(f"blocked_function:{func}")
+    for prefix in BLOCKED_TABLE_PREFIXES:
+        if prefix in lower:
+            violations.append(f"blocked_table_prefix:{prefix.rstrip('.')}")
+    if _has_case_expression(normalized_sql):
+        violations.append("case_expression_not_allowed")
+    if _has_case_without_else(normalized_sql):
+        violations.append("case_without_else_not_allowed")
+    violations.extend(_detect_risky_person_join(normalized_sql))
+
+    referenced_tables = _extract_referenced_tables(normalized_sql)
+    cte_names = set(_extract_cte_names(normalized_sql))
+    allowed_tables = set(state.get("allowed_tables") or [])
+    if not allowed_tables:
+        violations.append("no_allowlisted_tables_discovered")
+    unknown_tables = [
+        table
+        for table in referenced_tables
+        if table not in allowed_tables and table.lower() not in cte_names
+    ]
+    if unknown_tables:
+        violations.append("unknown_tables_referenced")
+
+    enforced_sql, limit_applied, existing_limit = _enforce_limit(normalized_sql, max_rows)
+    allowed = not violations
+    rejection_class = ""
+    if any(x in violations for x in ("unknown_tables_referenced", "no_allowlisted_tables_discovered")):
+        rejection_class = "schema_forbidden"
+    elif any(
+        x in violations
+        for x in (
+            "union_not_allowed",
+            "cast_not_allowed",
+            "case_expression_not_allowed",
+            "case_without_else_not_allowed",
+            "cross_join_not_allowed",
+            "into_outfile_not_allowed",
+            "load_file_not_allowed",
+            "settings_clause_not_allowed",
+        )
+    ):
+        rejection_class = "syntax_forbidden"
+    elif violations:
+        rejection_class = "safety_forbidden"
+    payload = {
+        "checked_at": _utc_now(),
+        "policy_version": POLICY_VERSION,
+        "allowed": allowed,
+        "rejection_class": rejection_class,
+        "violations": sorted(set(violations)),
+        "normalized_sql": normalized_sql,
+        "enforced_sql": enforced_sql,
+        "max_query_length": max_len,
+        "max_rows": max_rows,
+        "limit_applied": limit_applied,
+        "existing_limit": existing_limit,
+        "referenced_tables": referenced_tables,
+        "unknown_tables": unknown_tables,
+        "scan_budget_supported": False,
+        "rewrite_hints": (
+            (["Inspector blocks UNION. Use a single SELECT with conditional aggregation (for example countIf/sumIf/uniqIf)."] if "union_not_allowed" in violations else [])
+            + (["Inspector blocks CAST expressions. Remove CAST(...) and rely on native numeric operations or nullIf/countIf patterns."] if "cast_not_allowed" in violations else [])
+            + (["Do not use CASE expressions. Use countIf/sumIf/uniqIf/avgIf only."] if "case_expression_not_allowed" in violations else [])
+            + (["CASE expressions are not allowed for signal queries; use countIf/sumIf/uniqIf/avgIf instead."] if "case_without_else_not_allowed" in violations else [])
+            + (["PostHog HogQL doesn't support a SETTINGS clause (e.g. SETTINGS allow_experimental_analyzer=1). Remove it; the same query without SETTINGS is accepted."] if "settings_clause_not_allowed" in violations else [])
+            + (
+                [
+                    "Avoid joining events.distinct_id to persons.id (String vs UUID mismatch). Use events.distinct_id as entity grain, or join using a verified compatible persons key."
+                ]
+                if (
+                    "risky_join_events_distinct_id_to_persons_id" in violations
+                    or "risky_join_persons_id_to_events_distinct_id" in violations
+                )
+                else []
+            )
+        ),
+    }
+    state.setdefault("policy_validations", []).append(payload)
+    _record_artifact(state, "policy_validations", payload, append=True)
+    return payload
+
+
+def _execute_sql_proxy(session_id: str, sql: str) -> Dict[str, Any]:
+    env = inspector_env()
+    if not env["agent_secret"]:
+        return {"ok": False, "error": "missing_inspector_agent_secret"}
+    timeout_sec = _to_int_env("SIGNAL_AGENT_QUERY_TIMEOUT_SEC", 90)
+    payload = {"session_id": session_id, "query": sql}
+    cache_key = f"signal_query:v1:session_id={session_id}:query={sql}"
+    cached = cache_read_json(cache_key)
+    if isinstance(cached, dict):
+        return {
+            "ok": True,
+            "cached": True,
+            "types": cached.get("types"),
+            "results": cached.get("results", []),
+        }
+    try:
+        resp = inspector_post(
+            env["url"],
+            "/api/agent/sql-proxy",
+            env["agent_secret"],
+            env["vercel_protection"],
+            payload,
+            timeout=timeout_sec,
+            include_vercel=True,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": "sql_proxy_error", "detail": str(exc)}
+    cache_write_json(cache_key, resp)
+    return {"ok": True, "cached": False, "types": resp.get("types"), "results": resp.get("results", [])}
+
+
+def _signal_query_cache_key(session_id: str, sql: str) -> str:
+    return f"signal_query:v1:session_id={session_id}:query={sql}"
+
+
+def _has_cached_sql_result(session_id: str, sql: str) -> bool:
+    cached = cache_read_json(_signal_query_cache_key(session_id, sql))
+    return isinstance(cached, dict)
+
+
+def _purpose_counts_against_budget(purpose: str) -> bool:
+    normalized = str(purpose or "").strip().lower()
+    if normalized.startswith("profile_events:"):
+        return False
+    return True
+
+
+def run_readonly_query(
+    sql: str,
+    purpose: str = "",
+    expected_grain: str = "",
+    session_id: str = "",
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        sid = _session_id_arg(session_id, state)
+        if not sid:
+            return {"ok": False, "error": "missing_session_id"}
+        max_queries = _to_int_env("SIGNAL_AGENT_MAX_QUERIES", 12)
+        query_count = int(state.get("query_count") or 0)
+
+        policy = validate_sql_policy(sql, tool_context=tool_context)
+        sql_attempt = {
+            "attempted_at": _utc_now(),
+            "purpose": purpose,
+            "expected_grain": expected_grain,
+            "sql": sql,
+            "policy_allowed": policy.get("allowed", False),
+            "policy_violations": policy.get("violations", []),
+        }
+        state.setdefault("sql_attempts", []).append(sql_attempt)
+        _record_artifact(state, "sql_attempts", sql_attempt, append=True)
+        if not policy.get("allowed"):
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "error": "policy_blocked",
+                "rejection_class": policy.get("rejection_class", ""),
+                "violations": policy.get("violations", []),
+                "unknown_tables": policy.get("unknown_tables", []),
+                "rewrite_hints": policy.get("rewrite_hints", []),
+            }
+
+        enforced_sql = str(policy.get("enforced_sql") or "")
+        counts_against_budget = _purpose_counts_against_budget(purpose)
+        cached_hit = _has_cached_sql_result(sid, enforced_sql)
+        if counts_against_budget and not cached_hit and query_count >= max_queries:
+            outcome = {
+                "ok": False,
+                "error": "query_budget_exceeded",
+                "max_queries": max_queries,
+                "query_count": query_count,
+                "purpose": purpose,
+                "cached": False,
+                "at": _utc_now(),
+            }
+            state.setdefault("execution_summaries", []).append(outcome)
+            _record_artifact(state, "execution_summaries", outcome, append=True)
+            return outcome
+
+        exec_resp = _execute_sql_proxy(sid, enforced_sql)
+        if not exec_resp.get("ok"):
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            outcome_payload = {
+                "status": "error",
+                "purpose": purpose,
+                "expected_grain": expected_grain,
+                "sql": enforced_sql,
+                "error": exec_resp.get("error"),
+                "detail": exec_resp.get("detail"),
+                "at": _utc_now(),
+            }
+            state.setdefault("execution_summaries", []).append(outcome_payload)
+            _record_artifact(state, "execution_summaries", outcome_payload, append=True)
+            return {"ok": False, **outcome_payload}
+
+        if counts_against_budget and not bool(exec_resp.get("cached")):
+            state["query_count"] = query_count + 1
+        rows = exec_resp.get("results") or []
+        types = exec_resp.get("types") or []
+        llm_rows = _truncate_rows_for_llm(rows)
+        outcome = ExecutionOutcome(
+            status="ok",
+            purpose=purpose or "signal_query",
+            expected_grain=expected_grain,
+            sql=str(policy.get("enforced_sql") or ""),
+            row_count=len(rows),
+            column_count=len(types) if isinstance(types, list) else 0,
+            cached=bool(exec_resp.get("cached")),
+            notes="",
+        ).model_dump()
+        state.setdefault("execution_summaries", []).append(outcome)
+        _record_artifact(state, "execution_summaries", outcome, append=True)
+        return {
+            "ok": True,
+            "query": policy.get("enforced_sql"),
+            "purpose": purpose,
+            "expected_grain": expected_grain,
+            "columns": types,
+            "rows": llm_rows,
+            "row_count": len(rows),
+            "returned_row_count": len(llm_rows),
+            "cached": bool(exec_resp.get("cached")),
+            "policy_version": POLICY_VERSION,
+        }
+    except Exception as exc:
+        return _tool_exception("run_readonly_query", exc, state)
+
+
+def sample_rows(table_name: str, session_id: str = "", limit: int = 20, tool_context: Any = None) -> Dict[str, Any]:
+    default_limit = _to_int_env("SIGNAL_AGENT_SAMPLE_ROWS_LIMIT", 5)
+    requested_limit = int(limit) if int(limit) > 0 else default_limit
+    safe_limit = max(1, min(requested_limit, _to_int_env("SIGNAL_AGENT_MAX_ROWS", 200)))
+    sql = f"SELECT * FROM {table_name.strip()} LIMIT {safe_limit}"
+    return run_readonly_query(
+        sql=sql,
+        purpose=f"sample_rows:{table_name}",
+        expected_grain="row_sample",
+        session_id=session_id,
+        tool_context=tool_context,
+    )
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_row_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    if isinstance(row, list) and 0 <= index < len(row):
+        return row[index]
+    return None
+
+
+def _extract_event_profile(rows: List[Any], event_col_name: str) -> List[Dict[str, Any]]:
+    event_totals: Dict[str, Dict[str, Any]] = {}
+    normalized_col = (event_col_name or "").strip() or "event_name"
+    for row in rows:
+        raw_event = _extract_row_value(row, "event_name", 1)
+        if raw_event is None:
+            raw_event = _extract_row_value(row, normalized_col, 1)
+        event_name = str(raw_event or "").strip()
+        if not event_name:
+            continue
+        event_count = _coerce_int(_extract_row_value(row, "event_count", 2), 0)
+        distinct_hint = _coerce_int(_extract_row_value(row, "distinct_distinct_id", 3), 0)
+        bucket = event_totals.setdefault(
+            event_name,
+            {"event_name": event_name, "event_count": 0, "distinct_users_hint": 0},
+        )
+        bucket["event_count"] = int(bucket["event_count"]) + event_count
+        bucket["distinct_users_hint"] = int(bucket["distinct_users_hint"]) + distinct_hint
+    return sorted(event_totals.values(), key=lambda x: int(x.get("event_count") or 0), reverse=True)[:40]
+
+
+def _event_name_lexical_score(event_name: str, success_event_hint: str) -> float:
+    lower = (event_name or "").strip().lower()
+    if not lower:
+        return 0.0
+    hint = (success_event_hint or "").strip().lower() or "user_signup"
+    if lower == hint:
+        return 1.0
+    if hint in lower:
+        return 0.95
+    keyword_weights = (
+        ("user_signup", 0.95),
+        ("signup", 0.9),
+        ("sign_up", 0.9),
+        ("sign-up", 0.9),
+        ("register", 0.85),
+        ("subscription", 0.8),
+        ("subscribe", 0.8),
+        ("upgrade", 0.75),
+        ("purchase", 0.7),
+        ("checkout", 0.7),
+        ("billing", 0.55),
+    )
+    for keyword, score in keyword_weights:
+        if keyword in lower:
+            return score
+    return 0.0
+
+
+def _signal_proxy_name(table_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(table_name or "").lower()).strip("_")
+    if not slug:
+        slug = "person"
+    return f"{slug}_created_proxy"
+
+
+def _infer_success_proxy(
+    profile: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    persons_table = str(profile.get("primary_persons_table") or "").strip()
+    if not persons_table:
+        return {}
+    top_event_names = [
+        str(item.get("event_name") or "").strip()
+        for item in candidates
+        if isinstance(item, dict) and str(item.get("event_name") or "").strip()
+    ][:5]
+    proxy_name = _signal_proxy_name(persons_table)
+    return {
+        "success_proxy_mode": "persons_table_created_proxy",
+        "success_proxy_table": persons_table,
+        "success_proxy_name": proxy_name,
+        "success_proxy_reason": (
+            "No high-confidence conversion event was found in the events table. "
+            f"Using {persons_table} as the downstream conversion proxy."
+        ),
+        "success_proxy_top_event_hints": top_event_names,
+    }
+
+
+def _infer_success_event_from_profile(
+    event_profile: List[Dict[str, Any]], success_event_hint: str
+) -> Tuple[str, float, bool, List[Dict[str, Any]]]:
+    if not event_profile:
+        fallback = (success_event_hint or "").strip() or "user_signup"
+        return fallback, 0.25, True, []
+    total_events = max(1, sum(_coerce_int(item.get("event_count"), 0) for item in event_profile))
+    scored: List[Dict[str, Any]] = []
+    for item in event_profile:
+        event_name = str(item.get("event_name") or "").strip()
+        if not event_name:
+            continue
+        lexical_score = _event_name_lexical_score(event_name, success_event_hint)
+        volume_share = min(0.2, _coerce_float(item.get("event_count"), 0.0) / total_events)
+        score = lexical_score + volume_share
+        scored.append(
+            {
+                "event_name": event_name,
+                "event_count": _coerce_int(item.get("event_count"), 0),
+                "distinct_users_hint": _coerce_int(item.get("distinct_users_hint"), 0),
+                "lexical_score": round(lexical_score, 4),
+                "score": round(score, 4),
+            }
+        )
+    scored.sort(key=lambda x: _coerce_float(x.get("score"), 0.0), reverse=True)
+    best = scored[0] if scored else {}
+    best_name = str(best.get("event_name") or "").strip()
+    best_score = _coerce_float(best.get("score"), 0.0)
+    if best_name and best_score >= 0.7:
+        confidence = min(0.99, max(0.55, best_score))
+        return best_name, confidence, False, scored[:8]
+    fallback = (success_event_hint or "").strip() or "user_signup"
+    fallback_bonus = 0.15 if any(str(x.get("event_name") or "").strip().lower() == fallback.lower() for x in scored) else 0.0
+    return fallback, min(0.75, 0.35 + fallback_bonus), True, scored[:8]
+
+
+def _build_cohort_sql_snippets(
+    events_table: str,
+    person_col: str,
+    time_col: str,
+    event_col: str,
+    session_col: str,
+    success_event_name: str,
+    failure_inactivity_days: int,
+) -> Dict[str, str]:
+    table = events_table.strip() or "events"
+    pid = person_col.strip() or "distinct_id"
+    ts = time_col.strip() or "timestamp"
+    ev = event_col.strip() or "event"
+    sess = session_col.strip() or "$session_id"
+    success_value = success_event_name.replace("'", "\\'")
+    inactive_days = max(1, int(failure_inactivity_days))
+    return {
+        "success_users_30d": (
+            f"SELECT DISTINCT {pid} AS person_id "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"AND {ts} >= now() - INTERVAL 30 DAY"
+        ),
+        "failure_users_inactive_gt_days": (
+            f"SELECT {pid} AS person_id "
+            f"FROM {table} "
+            f"GROUP BY {pid} "
+            f"HAVING max({ts}) < now() - INTERVAL {inactive_days} DAY "
+            f"AND {pid} NOT IN ("
+            f"SELECT DISTINCT {pid} FROM {table} WHERE {ev} = '{success_value}'"
+            f")"
+        ),
+        "grey_users_active_non_success_30d": (
+            f"SELECT DISTINCT {pid} AS person_id "
+            f"FROM {table} "
+            f"WHERE {ts} >= now() - INTERVAL 30 DAY "
+            f"AND {pid} NOT IN ("
+            f"SELECT DISTINCT {pid} FROM {table} WHERE {ev} = '{success_value}'"
+            f") "
+            f"AND {pid} NOT IN ("
+            f"SELECT {pid} FROM {table} GROUP BY {pid} "
+            f"HAVING max({ts}) < now() - INTERVAL {inactive_days} DAY"
+            f")"
+        ),
+        "precursor_path_same_session": (
+            f"WITH success AS ("
+            f"SELECT {pid} AS person_id, {sess} AS session_id, min({ts}) AS success_ts "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"GROUP BY {pid}, {sess}"
+            f") "
+            f"SELECT e.{ev} AS precursor_event, countDistinct(e.{pid}) AS users "
+            f"FROM {table} e "
+            f"INNER JOIN success s ON e.{pid} = s.person_id AND e.{sess} = s.session_id "
+            f"WHERE e.{ts} < s.success_ts "
+            f"AND e.{ts} >= s.success_ts - INTERVAL 1 DAY "
+            f"GROUP BY precursor_event "
+            f"ORDER BY users DESC LIMIT 50"
+        ),
+        "precursor_path_7d": (
+            f"WITH success AS ("
+            f"SELECT {pid} AS person_id, min({ts}) AS success_ts "
+            f"FROM {table} "
+            f"WHERE {ev} = '{success_value}' "
+            f"GROUP BY {pid}"
+            f") "
+            f"SELECT e.{ev} AS precursor_event, countDistinct(e.{pid}) AS users "
+            f"FROM {table} e "
+            f"INNER JOIN success s ON e.{pid} = s.person_id "
+            f"WHERE e.{ts} < s.success_ts "
+            f"AND e.{ts} >= s.success_ts - INTERVAL 7 DAY "
+            f"GROUP BY precursor_event "
+            f"ORDER BY users DESC LIMIT 50"
+        ),
+    }
+
+
+def profile_events(
+    table_name: str,
+    time_col: str,
+    event_col: str,
+    distinct_keys: Optional[List[str]] = None,
+    session_id: str = "",
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    keys = [key.strip() for key in (distinct_keys or []) if key and key.strip()]
+    keys = keys[: max(1, _to_int_env("SIGNAL_AGENT_PROFILE_DISTINCT_KEY_LIMIT", 3))]
+    distinct_fragments = [f"COUNT(DISTINCT {key}) AS distinct_{key}" for key in keys[:6]]
+    profile_limit = max(10, _to_int_env("SIGNAL_AGENT_PROFILE_EVENTS_LIMIT", 60))
+    metrics_sql = ",\n       ".join(["COUNT(*) AS event_count"] + distinct_fragments)
+    sql = (
+        f"SELECT dateTrunc('day', {time_col}) AS event_day,\n"
+        f"       {event_col} AS event_name,\n"
+        f"       {metrics_sql}\n"
+        f"FROM {table_name}\n"
+        f"GROUP BY event_day, event_name\n"
+        f"ORDER BY event_day DESC, event_count DESC\n"
+        f"LIMIT {profile_limit}"
+    )
+    result = run_readonly_query(
+        sql=sql,
+        purpose=f"profile_events:{table_name}",
+        expected_grain="event_day_event_name",
+        session_id=session_id,
+        tool_context=tool_context,
+    )
+    if not result.get("ok"):
+        return result
+    rows = result.get("rows") or []
+    event_profile = _extract_event_profile(rows, event_col)
+    snapshot = {
+        "captured_at": _utc_now(),
+        "table_name": table_name,
+        "time_col": time_col,
+        "event_col": event_col,
+        "distinct_keys": keys,
+        "top_events": event_profile,
+    }
+    state["latest_event_profile"] = snapshot
+    _record_artifact(state, "event_profile_snapshot", snapshot, append=False)
+    return {**result, "top_events": event_profile[:12]}
+
+
+def infer_signal_objective(
+    success_event_hint: str = "user_signup",
+    failure_inactivity_days: int = 7,
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    profile = state.get("warehouse_profile") or {}
+    events_meta = profile.get("events_table") if isinstance(profile.get("events_table"), dict) else {}
+    latest_profile = state.get("latest_event_profile") or {}
+    events_table = (
+        str(profile.get("primary_events_table") or "")
+        or str(events_meta.get("table_name") or "")
+        or str(latest_profile.get("table_name") or "")
+        or "events"
+    )
+    time_col = (
+        str(profile.get("inferred_time_column") or "")
+        or str(events_meta.get("time_column") or "")
+        or str(latest_profile.get("time_col") or "")
+        or "timestamp"
+    )
+    event_col = (
+        str(profile.get("inferred_event_column") or "")
+        or str(events_meta.get("event_column") or "")
+        or str(latest_profile.get("event_col") or "")
+        or "event"
+    )
+    person_col = (
+        str(profile.get("inferred_distinct_id_column") or "")
+        or str(events_meta.get("person_column") or "")
+        or "distinct_id"
+    )
+    session_col = (
+        str(profile.get("inferred_session_column") or "")
+        or str(events_meta.get("session_column") or "")
+        or "$session_id"
+    )
+    top_events = latest_profile.get("top_events") if isinstance(latest_profile.get("top_events"), list) else []
+    success_event, confidence, fallback_used, candidates = _infer_success_event_from_profile(
+        event_profile=top_events,
+        success_event_hint=success_event_hint,
+    )
+    success_proxy = {}
+    objective_notes = [
+        "Success target inferred from profiled events with lexical+volume scoring.",
+        "Failure cohort is inactivity > failure_inactivity_days and excludes any success user.",
+    ]
+    cohort_sql_snippets = _build_cohort_sql_snippets(
+        events_table=events_table,
+        person_col=person_col,
+        time_col=time_col,
+        event_col=event_col,
+        session_col=session_col,
+        success_event_name=success_event,
+        failure_inactivity_days=max(1, int(failure_inactivity_days)),
+    )
+    if fallback_used and confidence <= 0.45:
+        success_proxy = _infer_success_proxy(profile, candidates)
+        if success_proxy:
+            success_event = str(success_proxy.get("success_proxy_name") or success_event)
+            objective_notes.append(str(success_proxy.get("success_proxy_reason") or ""))
+            objective_notes.append(
+                "Treat success_event_name as a conversion proxy label, not as a literal event expected in the events table."
+            )
+            cohort_sql_snippets = {}
+    payload = {
+        "success_event_name": success_event,
+        "success_event_confidence": round(confidence, 4),
+        "success_fallback_used": bool(fallback_used),
+        "success_event_candidates": candidates,
+        "failure_inactivity_days": max(1, int(failure_inactivity_days)),
+        "success_overrides_failure": True,
+        "events_table": events_table,
+        "events_time_column": time_col,
+        "events_event_column": event_col,
+        "events_person_column": person_col,
+        "events_session_column": session_col,
+        "objective_notes": objective_notes,
+        "cohort_sql_snippets": cohort_sql_snippets,
+        "captured_at": _utc_now(),
+        **success_proxy,
+    }
+    ok, validated = _safe_model_validate(SignalObjective, payload)
+    if not ok:
+        state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+        return validated
+    state["signal_objective"] = validated
+    _record_artifact(state, "signal_objective", validated, append=False)
+    return {"ok": True, "signal_objective": validated}
+
+
+def get_signal_objective(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    objective = state.get("signal_objective")
+    if isinstance(objective, dict) and objective.get("success_event_name"):
+        return {"ok": True, "signal_objective": objective}
+    inferred = infer_signal_objective(tool_context=tool_context)
+    if not inferred.get("ok"):
+        return inferred
+    return {"ok": True, "signal_objective": inferred.get("signal_objective", {})}
+
+
+def get_warehouse_profile(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    profile = state.get("warehouse_profile") or {}
+    return {"ok": True, "warehouse_profile": profile}
+
+
+def get_signal_objective_compact(tool_context: Any = None) -> Dict[str, Any]:
+    full = get_signal_objective(tool_context=tool_context)
+    if not full.get("ok"):
+        return full
+    objective = full.get("signal_objective") or {}
+    return {
+        "ok": True,
+        "signal_objective": {
+            "success_event_name": objective.get("success_event_name"),
+            "success_event_confidence": objective.get("success_event_confidence"),
+            "success_fallback_used": objective.get("success_fallback_used"),
+            "success_proxy_mode": objective.get("success_proxy_mode"),
+            "success_proxy_table": objective.get("success_proxy_table"),
+            "success_proxy_name": objective.get("success_proxy_name"),
+            "success_proxy_reason": objective.get("success_proxy_reason"),
+            "failure_inactivity_days": objective.get("failure_inactivity_days"),
+            "success_overrides_failure": objective.get("success_overrides_failure"),
+            "events_table": objective.get("events_table"),
+            "events_time_column": objective.get("events_time_column"),
+            "events_event_column": objective.get("events_event_column"),
+            "events_person_column": objective.get("events_person_column"),
+            "events_session_column": objective.get("events_session_column"),
+        },
+    }
+
+
+def get_warehouse_profile_compact(tool_context: Any = None) -> Dict[str, Any]:
+    full = get_warehouse_profile(tool_context=tool_context)
+    if not full.get("ok"):
+        return full
+    profile = full.get("warehouse_profile") or {}
+    return {
+        "ok": True,
+        "warehouse_profile": {
+            "session_id": profile.get("session_id"),
+            "primary_events_table": profile.get("primary_events_table"),
+            "primary_persons_table": profile.get("primary_persons_table"),
+            "inferred_time_column": profile.get("inferred_time_column"),
+            "inferred_event_column": profile.get("inferred_event_column"),
+            "inferred_distinct_id_column": profile.get("inferred_distinct_id_column"),
+            "inferred_session_column": profile.get("inferred_session_column"),
+            "inferred_group_column": profile.get("inferred_group_column"),
+            "inferred_properties_column": profile.get("inferred_properties_column"),
+            "available_tables": list(profile.get("available_tables") or [])[:20],
+        },
+    }
+
+
+def _string_or_empty(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _column_name(column: Any) -> str:
+    if isinstance(column, str):
+        return column.strip()
+    if isinstance(column, dict):
+        for key in ("column_name", "col_name", "name", "col_id"):
+            value = column.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _table_identity(table: Dict[str, Any]) -> str:
+    return (
+        _string_or_empty(table.get("queryable_name"))
+        or _string_or_empty(table.get("table_id"))
+        or _string_or_empty(table.get("name"))
+    )
+
+
+def _table_columns(table: Dict[str, Any]) -> List[str]:
+    columns = table.get("columns")
+    names: List[str] = []
+    if isinstance(columns, list):
+        for column in columns:
+            name = _column_name(column)
+            if name and name not in names:
+                names.append(name)
+    sample_summary = table.get("sample_summary")
+    if isinstance(sample_summary, dict):
+        summary_columns = sample_summary.get("columns")
+        if isinstance(summary_columns, dict):
+            for name in summary_columns.keys():
+                if isinstance(name, str) and name.strip() and name not in names:
+                    names.append(name.strip())
+    return names
+
+
+def _keyword_score(value: str, keywords: Tuple[str, ...]) -> int:
+    lowered = value.lower()
+    return sum(1 for keyword in keywords if keyword in lowered)
+
+
+def _table_role_score(table: Dict[str, Any], role: str) -> int:
+    identity = _table_identity(table).lower()
+    columns = [column.lower() for column in _table_columns(table)]
+    column_blob = " ".join(columns)
+    if role == "events":
+        score = _keyword_score(identity, ("event", "events", "posthog", "activity"))
+        score += _keyword_score(column_blob, ("event", "event_name", "timestamp", "distinct_id", "session"))
+        if "distinct_id" in columns:
+            score += 2
+        if "timestamp" in columns:
+            score += 2
+        return score
+    if role == "persons":
+        score = _keyword_score(identity, ("person", "persons", "user", "users", "profile", "profiles"))
+        score += _keyword_score(column_blob, ("email", "user_id", "person_id", "distinct_id", "name"))
+        if "email" in columns:
+            score += 2
+        return score
+    return 0
+
+
+def _pick_best_table(table_summaries: List[Dict[str, Any]], role: str) -> str:
+    best_name = ""
+    best_score = -1
+    for table in table_summaries:
+        if not isinstance(table, dict):
+            continue
+        name = _table_identity(table)
+        if not name:
+            continue
+        score = _table_role_score(table, role)
+        if score > best_score:
+            best_name = name
+            best_score = score
+    return best_name if best_score > 0 else ""
+
+
+def _find_column(columns: List[str], preferred: Tuple[str, ...]) -> str:
+    lowered = [column.lower() for column in columns]
+    for target in preferred:
+        for idx, column in enumerate(lowered):
+            if column == target:
+                return columns[idx]
+    for target in preferred:
+        for idx, column in enumerate(lowered):
+            if target in column:
+                return columns[idx]
+    return ""
+
+
+def _infer_semantic_columns(columns: List[str]) -> Dict[str, str]:
+    return {
+        "time": _find_column(columns, ("timestamp", "created_at", "event_time", "time", "ts", "occurred_at")),
+        "event": _find_column(columns, ("event", "event_name", "name", "action")),
+        "person": _find_column(columns, ("distinct_id", "person_id", "user_id", "profile_id", "customer_id")),
+        "session": _find_column(columns, ("$session_id", "session_id", "session")),
+        "group": _find_column(columns, ("group_id", "account_id", "company_id", "organization_id", "org_id")),
+        "properties": _find_column(columns, ("properties", "event_properties", "props")),
+    }
+
+
+def _table_details_for_snapshot(table_summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    details: Dict[str, Any] = {}
+    captured_at = _utc_now()
+    for table in table_summaries:
+        if not isinstance(table, dict):
+            continue
+        identity = _table_identity(table)
+        if not identity:
+            continue
+        details[identity] = {
+            "columns": [{"column_name": column} for column in _table_columns(table)],
+            "captured_at": captured_at,
+        }
+    return details
+
+
+def _upstream_table_summaries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    dwh_analytics = state.get("dwh_analytics")
+    if isinstance(dwh_analytics, dict):
+        table_summaries = dwh_analytics.get("table_summaries")
+        if isinstance(table_summaries, list) and table_summaries:
+            return [item for item in table_summaries if isinstance(item, dict)]
+    inspector_eda = state.get("inspector_dwh_eda")
+    if isinstance(inspector_eda, dict):
+        table_summaries = inspector_eda.get("table_summaries")
+        if isinstance(table_summaries, list) and table_summaries:
+            return [item for item in table_summaries if isinstance(item, dict)]
+    return []
+
+
+def hydrate_signal_context_from_upstream(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    table_summaries = _upstream_table_summaries(state)
+    allowed_tables: List[str] = []
+    normalized_tables: List[Dict[str, Any]] = []
+    for table in table_summaries:
+        identity = _table_identity(table)
+        if not identity:
+            continue
+        columns = _table_columns(table)
+        normalized = dict(table)
+        normalized["resolved_identity"] = identity
+        normalized["resolved_columns"] = columns
+        normalized_tables.append(normalized)
+        if identity not in allowed_tables:
+            allowed_tables.append(identity)
+
+    state["allowed_tables"] = sorted(allowed_tables)
+    schema_snapshot = {
+        "captured_at": _utc_now(),
+        "table_names": list(state["allowed_tables"]),
+        "table_details": _table_details_for_snapshot(normalized_tables),
+    }
+    state["schema_snapshot"] = schema_snapshot
+    _record_artifact(state, "schema_snapshot", schema_snapshot, append=False)
+
+    primary_events_table = _pick_best_table(normalized_tables, "events")
+    primary_persons_table = _pick_best_table(normalized_tables, "persons")
+    event_table_meta = next(
+        (table for table in normalized_tables if _table_identity(table) == primary_events_table),
+        {},
+    )
+    semantic_columns = _infer_semantic_columns(_table_columns(event_table_meta))
+
+    website_context = state.get("website_context") if isinstance(state.get("website_context"), dict) else {}
+    company_summary = website_context.get("company_summary") if isinstance(website_context, dict) else {}
+    dwh_analytics = state.get("dwh_analytics") if isinstance(state.get("dwh_analytics"), dict) else {}
+    dwh_summary = dwh_analytics.get("dwh_summary") if isinstance(dwh_analytics, dict) else {}
+
+    notes: List[str] = []
+    business_model = _string_or_empty(company_summary.get("business_model")) if isinstance(company_summary, dict) else ""
+    product = _string_or_empty(company_summary.get("product")) if isinstance(company_summary, dict) else ""
+    icp = _string_or_empty(company_summary.get("icp")) if isinstance(company_summary, dict) else ""
+    dwh_summary_text = _string_or_empty(dwh_analytics.get("summary_text"))
+    if business_model:
+        notes.append(f"Website business model: {business_model}")
+    if product:
+        notes.append(f"Website product summary: {product}")
+    if icp:
+        notes.append(f"Website ICP: {icp}")
+    if dwh_summary_text:
+        notes.append(f"DWH summary: {dwh_summary_text}")
+    if isinstance(dwh_summary, dict) and _string_or_empty(dwh_summary.get("notes")):
+        notes.append(f"DWH notes: {_string_or_empty(dwh_summary.get('notes'))}")
+
+    payload = {
+        "ok": True,
+        "warehouse_profile": {
+            "session_id": _string_or_empty(state.get("session_id")),
+            "primary_events_table": primary_events_table,
+            "primary_persons_table": primary_persons_table,
+            "inferred_time_column": semantic_columns.get("time", ""),
+            "inferred_event_column": semantic_columns.get("event", ""),
+            "inferred_distinct_id_column": semantic_columns.get("person", ""),
+            "inferred_session_column": semantic_columns.get("session", ""),
+            "inferred_group_column": semantic_columns.get("group", ""),
+            "inferred_properties_column": semantic_columns.get("properties", ""),
+            "available_tables": list(state["allowed_tables"]),
+            "notes": notes,
+        },
+        "schema_snapshot": schema_snapshot,
+        "allowed_tables": list(state["allowed_tables"]),
+        "source_table_count": len(normalized_tables),
+    }
+    state["upstream_signal_context"] = payload
+    return payload
+
+
+def prepare_signal_inputs(
+    session_id: str = "",
+    success_event_hint: str = "user_signup",
+    tool_context: Any = None,
+) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    init_result = initialize_signal_run(session_id=session_id, tool_context=tool_context)
+    if not init_result.get("ok"):
+        return init_result
+
+    bridge = hydrate_signal_context_from_upstream(tool_context=tool_context)
+    if not bridge.get("ok"):
+        return bridge
+    load_existing_signals(tool_context=tool_context)
+
+    initial_profile = bridge.get("warehouse_profile") or {}
+    profile_result = store_warehouse_profile(initial_profile, tool_context=tool_context)
+    if not profile_result.get("ok"):
+        return profile_result
+
+    profile_events_result: Dict[str, Any] = {"ok": False, "status": "skipped"}
+    resolved_profile = profile_result.get("warehouse_profile") or {}
+    events_table = _string_or_empty(resolved_profile.get("primary_events_table"))
+    time_col = _string_or_empty(resolved_profile.get("inferred_time_column"))
+    event_col = _string_or_empty(resolved_profile.get("inferred_event_column"))
+    person_col = _string_or_empty(resolved_profile.get("inferred_distinct_id_column"))
+    session_col = _string_or_empty(resolved_profile.get("inferred_session_column"))
+    distinct_keys = [value for value in (person_col, session_col) if value]
+    if events_table and time_col and event_col:
+        profile_events_result = profile_events(
+            table_name=events_table,
+            time_col=time_col,
+            event_col=event_col,
+            distinct_keys=distinct_keys,
+            session_id=_string_or_empty(state.get("session_id")),
+            tool_context=tool_context,
+        )
+
+    objective_result = infer_signal_objective(
+        success_event_hint=success_event_hint,
+        tool_context=tool_context,
+    )
+    if not objective_result.get("ok"):
+        return objective_result
+
+    objective = objective_result.get("signal_objective") or {}
+    enriched_profile = {
+        **initial_profile,
+        "success_event_name": _string_or_empty(objective.get("success_event_name")),
+        "success_event_confidence": objective.get("success_event_confidence", 0.0),
+        "success_fallback_used": bool(objective.get("success_fallback_used")),
+        "success_proxy_mode": _string_or_empty(objective.get("success_proxy_mode")),
+        "success_proxy_table": _string_or_empty(objective.get("success_proxy_table")),
+        "success_proxy_name": _string_or_empty(objective.get("success_proxy_name")),
+        "failure_inactivity_days": objective.get("failure_inactivity_days", 7),
+        "success_overrides_failure": bool(objective.get("success_overrides_failure", True)),
+    }
+    final_profile_result = store_warehouse_profile(enriched_profile, tool_context=tool_context)
+    if not final_profile_result.get("ok"):
+        return final_profile_result
+
+    table_summaries: List[Dict[str, Any]] = []
+    for table in _upstream_table_summaries(state)[:8]:
+        identity = _table_identity(table)
+        if not identity:
+            continue
+        columns = _table_columns(table)[:8]
+        semantic = _infer_semantic_columns(columns)
+        table_summaries.append(
+            {
+                "table": identity,
+                "columns": columns,
+                "event_column": semantic.get("event", ""),
+                "time_column": semantic.get("time", ""),
+                "person_column": semantic.get("person", ""),
+            }
+        )
+    fingerprint_values = sorted(_fingerprint_lookup(state).keys())[:24]
+    state["signal_context_digest"] = {
+        "objective": {
+            "success_event_name": objective.get("success_event_name", ""),
+            "success_proxy_mode": objective.get("success_proxy_mode", ""),
+            "failure_definition": (
+                f"users with no events for >{int(objective.get('failure_inactivity_days') or 7)} days; "
+                "success cohort overrides failure"
+            ),
+            "entity_grain_preference": _string_or_empty(final_profile_result.get("warehouse_profile", {}).get("inferred_distinct_id_column")) or "distinct_id",
+        },
+        "warehouse": {
+            "allowed_tables": list(state.get("allowed_tables") or [])[:20],
+            "table_summaries": table_summaries,
+            "known_join_keys": [value for value in [person_col, session_col] if value],
+            "event_name_column": event_col,
+            "timestamp_column": time_col,
+            "constraints": [
+                "Read-only SELECT/WITH only",
+                "Use allowlisted tables only",
+                "Avoid UNION, CAST, CASE, CROSS JOIN, arrayJoin, remote/url functions",
+                "Prefer events.distinct_id as person grain unless compatibility is verified",
+            ],
+        },
+        "existing_signal_fingerprints": fingerprint_values,
+        "loop_limits": dict(state.get("loop_limits") or {}),
+    }
+
+    result = {
+        "ok": True,
+        "run_id": init_result.get("run_id"),
+        "session_id": init_result.get("session_id"),
+        "allowed_table_count": len(bridge.get("allowed_tables", [])),
+        "primary_events_table": final_profile_result.get("warehouse_profile", {}).get("primary_events_table", ""),
+        "success_event_name": objective.get("success_event_name", ""),
+        "profile_events_status": "ok" if profile_events_result.get("ok") else profile_events_result.get("status", "skipped"),
+        "source_table_count": bridge.get("source_table_count", 0),
+        "signal_context_digest": state.get("signal_context_digest") or {},
+    }
+    state["prepared_signal_inputs"] = result
+    return result
+
+
+def _safe_model_validate(model_cls: Any, payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    try:
+        validated = model_cls.model_validate(payload)
+    except ValidationError as exc:
+        return False, {"ok": False, "error": "validation_error", "detail": str(exc)}
+    return True, validated.model_dump()
+
+
+def _normalize_review_decision(review_payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(review_payload or {})
+    decision_raw = str(payload.get("decision") or payload.get("status") or "").strip().lower()
+    promoted_flag = bool(payload.get("promoted"))
+    approve_tokens = {"approve", "approved", "promote", "promoted", "accept", "accepted", "pass", "passed"}
+    decision = "approve" if (decision_raw in approve_tokens or promoted_flag) else "reject"
+
+    reasons_raw = payload.get("reasons")
+    reasons: List[str] = []
+    if isinstance(reasons_raw, list):
+        reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+    elif isinstance(payload.get("reason"), str) and payload.get("reason", "").strip():
+        reasons = [str(payload.get("reason")).strip()]
+
+    required_fixes_raw = payload.get("required_fixes")
+    required_fixes: List[str] = []
+    if isinstance(required_fixes_raw, list):
+        required_fixes = [str(item).strip() for item in required_fixes_raw if str(item).strip()]
+    elif isinstance(payload.get("required_fix"), str) and payload.get("required_fix", "").strip():
+        required_fixes = [str(payload.get("required_fix")).strip()]
+
+    promotion_readiness = bool(payload.get("promotion_readiness")) or decision == "approve"
+    normalized = {
+        "decision": decision,
+        "reasons": reasons,
+        "required_fixes": required_fixes,
+        "promotion_readiness": promotion_readiness,
+    }
+    if isinstance(payload.get("status"), str):
+        normalized["status"] = payload.get("status")
+    if isinstance(payload.get("reason"), str):
+        normalized["reason"] = payload.get("reason")
+    normalized["promoted"] = promoted_flag
+    return normalized
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _candidate_id() -> str:
+    return f"candidate_{uuid.uuid4().hex[:12]}"
+
+
+def _normalize_list_items(values: Any, limit: int = 6) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    items: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in items:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _find_candidate_record(state: Dict[str, Any], candidate_id: str) -> Optional[Dict[str, Any]]:
+    for item in state.get("candidate_signals") or []:
+        if isinstance(item, dict) and str(item.get("candidate_id") or "") == candidate_id:
+            return item
+    return None
+
+
+def _replace_candidate_record(state: Dict[str, Any], candidate_record: Dict[str, Any]) -> None:
+    candidate_id = str(candidate_record.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    items = state.setdefault("candidate_signals", [])
+    for idx, item in enumerate(items):
+        if isinstance(item, dict) and str(item.get("candidate_id") or "") == candidate_id:
+            items[idx] = candidate_record
+            return
+    items.append(candidate_record)
+
+
+def _compact_execution_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    rows = result.get("rows") or []
+    first_row = rows[0] if rows else None
+    return {
+        "ok": bool(result.get("ok")),
+        "row_count": int(result.get("row_count") or 0),
+        "returned_row_count": int(result.get("returned_row_count") or 0),
+        "cached": bool(result.get("cached")),
+        "columns": [str(col.get("name") or col.get("column_name") or "") for col in (result.get("columns") or [])[:8] if isinstance(col, dict)],
+        "sample_row": first_row if isinstance(first_row, (dict, list)) else {},
+    }
+
+
+def _candidate_semantic_basis(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": str(candidate.get("name") or "").strip().lower(),
+        "entity_grain": str(candidate.get("entity_grain") or "").strip().lower(),
+        "time_window": str(candidate.get("time_window") or "").strip().lower(),
+        "comparison_baseline": str(candidate.get("comparison_baseline") or "").strip().lower(),
+        "target_event": str(candidate.get("target_event") or "").strip().lower(),
+    }
+
+
+def _candidate_fingerprints(candidate: Dict[str, Any]) -> Dict[str, str]:
+    sql_value = _normalize_sql_value(str(candidate.get("query_template") or candidate.get("sql") or ""))
+    semantics = _candidate_semantic_basis(candidate)
+    return {
+        "sql": _stable_hash({"sql": sql_value}),
+        "semantics": _stable_hash(semantics),
+        "combined": _stable_hash({"sql": sql_value, **semantics}),
+    }
+
+
+def _fingerprint_lookup(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup = state.setdefault("candidate_fingerprints", {})
+    if isinstance(lookup, dict):
+        return lookup
+    repaired: Dict[str, Dict[str, Any]] = {}
+    state["candidate_fingerprints"] = repaired
+    return repaired
+
+
+def _collect_candidate_fingerprints_from_signal(signal: Dict[str, Any]) -> Dict[str, str]:
+    existing = signal.get("fingerprints")
+    if isinstance(existing, dict) and existing:
+        return {str(k): str(v) for k, v in existing.items() if str(v)}
+    return _candidate_fingerprints(signal)
+
+
+def _register_candidate_fingerprints(state: Dict[str, Any], candidate_record: Dict[str, Any]) -> None:
+    candidate_id = str(candidate_record.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    lookup = _fingerprint_lookup(state)
+    fingerprints = _collect_candidate_fingerprints_from_signal(candidate_record)
+    for fp_type, value in fingerprints.items():
+        if not value:
+            continue
+        lookup[value] = {
+            "candidate_id": candidate_id,
+            "fingerprint_type": fp_type,
+            "status": str(candidate_record.get("status") or ""),
+            "name": str(candidate_record.get("name") or ""),
+        }
+
+
+def _sync_candidate_compatibility_lists(state: Dict[str, Any]) -> None:
+    candidates = [item for item in (state.get("candidate_signals") or []) if isinstance(item, dict)]
+    state["candidate_hypotheses"] = [dict(item) for item in candidates]
+    execution_summaries = [item for item in (state.get("signal_execution_summaries") or []) if isinstance(item, dict)]
+    state["execution_summaries"] = [dict(item) for item in execution_summaries]
+
+
+def _build_candidate_record(candidate_payload: Dict[str, Any]) -> Dict[str, Any]:
+    record = dict(candidate_payload)
+    record.setdefault("candidate_id", _candidate_id())
+    record.setdefault("stored_at", _utc_now())
+    record.setdefault("status", "pending_review")
+    record.setdefault("review_status", "pending")
+    record["fingerprints"] = _candidate_fingerprints(record)
+    return record
+
+
+def _ensure_candidate_target_event(candidate_payload: Dict[str, Any], objective: Dict[str, Any]) -> None:
+    if candidate_payload.get("target_event"):
+        return
+    target_event = str(objective.get("success_event_name") or "").strip()
+    if target_event:
+        candidate_payload["target_event"] = target_event
+
+
+def _candidate_missing_fields(candidate_payload: Dict[str, Any]) -> List[str]:
+    required = (
+        "name",
+        "entity_grain",
+        "time_window",
+        "comparison_baseline",
+        "query_template",
+        "interpretation",
+    )
+    return [field for field in required if not str(candidate_payload.get(field) or "").strip()]
+
+
+def _append_signal_execution_summary(state: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    state.setdefault("signal_execution_summaries", []).append(payload)
+    _sync_candidate_compatibility_lists(state)
+
+
+def _safe_json_loads(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        loaded = json.loads(value)
+    except Exception:
+        return {}
+    return dict(loaded) if isinstance(loaded, dict) else {}
+
+
+def _append_unique_state_item(state: Dict[str, Any], key: str, payload: Dict[str, Any], dedupe_key: str = "") -> None:
+    items = state.setdefault(key, [])
+    if dedupe_key:
+        dedupe_value = str(payload.get(dedupe_key) or "")
+        if dedupe_value:
+            for item in items:
+                if isinstance(item, dict) and str(item.get(dedupe_key) or "") == dedupe_value:
+                    return
+    items.append(payload)
+
+
+def _candidate_mentions_success_target(payload: Dict[str, Any], objective: Dict[str, Any]) -> bool:
+    if str(objective.get("success_proxy_mode") or "").strip():
+        return True
+    if bool(objective.get("success_fallback_used")) and _coerce_float(objective.get("success_event_confidence"), 0.0) < 0.5:
+        return True
+    target = str(objective.get("success_event_name") or "").strip().lower()
+    if not target:
+        return True
+    direct_target = str(payload.get("target_event") or "").strip().lower()
+    if direct_target == target:
+        return True
+    corpus = " ".join(
+        [
+            str(payload.get("name") or ""),
+            str(payload.get("interpretation") or ""),
+            str(payload.get("query_template") or ""),
+            str(payload.get("entity_grain") or ""),
+        ]
+    ).lower()
+    return target in corpus
+
+
+def _candidate_has_cohort_evidence(payload: Dict[str, Any]) -> bool:
+    evidence = payload.get("promotion_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    required_markers = {
+        "success_cohort_size",
+        "failure_cohort_size",
+        "grey_cohort_size",
+        "conversion_lift",
+        "conversion_rate_delta",
+        "precision_proxy",
+    }
+    if any(marker in evidence for marker in required_markers):
+        return True
+    return bool(evidence.get("cohort_metrics"))
+
+
+def submit_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        payload = dict(candidate or {})
+        if isinstance(payload.get("promotion_evidence"), str):
+            payload["promotion_evidence"] = {"note": str(payload.get("promotion_evidence") or "").strip()}
+        payload.setdefault("parameter_set", {})
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        _ensure_candidate_target_event(payload, objective)
+        missing_fields = _candidate_missing_fields(payload)
+        if missing_fields:
+            state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "invalid_candidate",
+                "reason": f"missing required fields: {', '.join(missing_fields)}",
+                "violations": [f"missing_field:{field}" for field in missing_fields],
+                "rewrite_hints": ["Include all required candidate fields before submission."],
+            }
+        candidate_ok, validated_candidate = _safe_model_validate(CandidateSignalDraft, payload)
+        if not candidate_ok:
+            state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "invalid_candidate",
+                "reason": str(validated_candidate.get("detail") or "candidate validation failed"),
+                "violations": ["candidate_validation_error"],
+                "rewrite_hints": ["Match the expected candidate draft schema before retrying."],
+            }
+
+        record = _build_candidate_record(validated_candidate)
+        lookup = _fingerprint_lookup(state)
+        duplicate_match = None
+        for _, value in sorted(record.get("fingerprints", {}).items()):
+            existing = lookup.get(value)
+            if existing:
+                duplicate_match = existing
+                break
+        if duplicate_match:
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "duplicate",
+                "candidate_id": record.get("candidate_id"),
+                "reason": f"duplicate of {duplicate_match.get('candidate_id') or 'existing_signal'}",
+                "violations": ["duplicate_candidate"],
+                "rewrite_hints": ["Change the hypothesis, grain, time window, or SQL before retrying."],
+            }
+
+        policy = validate_sql_policy(str(record.get("query_template") or ""), tool_context=tool_context)
+        record["dedupe_result"] = {"is_duplicate": False}
+        record["policy_result"] = {
+            "allowed": bool(policy.get("allowed")),
+            "violations": list(policy.get("violations") or []),
+            "rewrite_hints": list(policy.get("rewrite_hints") or []),
+        }
+        if not policy.get("allowed"):
+            state["failure_count"] = int(state.get("failure_count") or 0) + 1
+            return {
+                "ok": False,
+                "status": "policy_blocked",
+                "candidate_id": record.get("candidate_id"),
+                "reason": "sql policy blocked candidate",
+                "violations": list(policy.get("violations") or []),
+                "rewrite_hints": list(policy.get("rewrite_hints") or []),
+            }
+
+        execution_result = run_readonly_query(
+            sql=str(record.get("query_template") or ""),
+            purpose=f"candidate_validation:{record.get('name') or record.get('candidate_id')}",
+            expected_grain=str(record.get("entity_grain") or ""),
+            session_id=str(state.get("session_id") or ""),
+            tool_context=tool_context,
+        )
+        if not execution_result.get("ok"):
+            return {
+                "ok": False,
+                "status": "query_failed",
+                "candidate_id": record.get("candidate_id"),
+                "reason": str(execution_result.get("error") or "query_failed"),
+                "violations": list(execution_result.get("violations") or []),
+                "rewrite_hints": list(execution_result.get("rewrite_hints") or []),
+            }
+
+        execution_summary = _compact_execution_summary(execution_result)
+        record["execution_outcome"] = {
+            "status": "ok",
+            "purpose": execution_result.get("purpose"),
+            "expected_grain": execution_result.get("expected_grain"),
+            "sql": execution_result.get("query"),
+            "row_count": int(execution_result.get("row_count") or 0),
+            "column_count": len(execution_result.get("columns") or []),
+            "cached": bool(execution_result.get("cached")),
+            "notes": "",
+        }
+        record["execution_evidence_summary"] = execution_summary
+        record["status"] = "pending_review"
+        record["review_status"] = "pending"
+
+        _replace_candidate_record(state, record)
+        _register_candidate_fingerprints(state, record)
+        state["last_candidate_signal_id"] = str(record.get("candidate_id") or "")
+        state["latest_pending_candidate_for_review"] = {
+            "candidate_id": record.get("candidate_id"),
+            "name": record.get("name"),
+            "entity_grain": record.get("entity_grain"),
+            "time_window": record.get("time_window"),
+            "comparison_baseline": record.get("comparison_baseline"),
+            "interpretation": record.get("interpretation"),
+            "target_event": record.get("target_event"),
+            "promotion_evidence": record.get("promotion_evidence"),
+            "execution_evidence_summary": execution_summary,
+            "query_template": record.get("query_template"),
+        }
+        _append_signal_execution_summary(
+            state,
+            {
+                "candidate_id": str(record.get("candidate_id") or ""),
+                "status": "ok",
+                "purpose": record["execution_outcome"].get("purpose"),
+                "expected_grain": record["execution_outcome"].get("expected_grain"),
+                "sql": record["execution_outcome"].get("sql"),
+                "row_count": int(record["execution_outcome"].get("row_count") or 0),
+                "column_count": int(record["execution_outcome"].get("column_count") or 0),
+                "cached": bool(record["execution_outcome"].get("cached")),
+                "notes": "",
+            },
+        )
+        _sync_candidate_compatibility_lists(state)
+        _record_artifact(state, "candidate_hypotheses", record, append=True)
+        _record_artifact(state, "execution_summaries", state["signal_execution_summaries"][-1], append=True)
+
+        return {
+            "ok": True,
+            "status": "pending_review",
+            "candidate_id": record.get("candidate_id"),
+            "dedupe": {"is_duplicate": False},
+            "policy": {"allowed": True},
+            "execution": {
+                "ok": True,
+                "row_count": int(execution_summary.get("row_count") or 0),
+                "evidence_summary": execution_summary,
+            },
+        }
+    except Exception as exc:
+        return _tool_exception("submit_candidate_signal", exc, state)
+
+
+def store_candidate_signal(candidate: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        payload = dict(candidate or {})
+        args_payload = {"candidate": payload}
+        cached = _tool_cache_get(state, "store_candidate_signal", args_payload)
+        if cached is not None:
+            return cached
+        payload.setdefault("stored_at", _utc_now())
+        if isinstance(payload.get("promotion_evidence"), str):
+            payload["promotion_evidence"] = {"note": str(payload.get("promotion_evidence") or "").strip()}
+        if not payload.get("target_event"):
+            objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+            if objective.get("success_event_name"):
+                payload["target_event"] = str(objective.get("success_event_name") or "")
+        requested_promoted = bool(payload.get("promoted")) or str(payload.get("status") or "").lower() == "promoted"
+        review_payload = payload.get("review_decision")
+        review_validated: Optional[Dict[str, Any]] = None
+        if isinstance(review_payload, dict):
+            normalized_review = _normalize_review_decision(review_payload)
+            review_ok, review_candidate = _safe_model_validate(ReviewDecision, normalized_review)
+            if review_ok:
+                review_validated = review_candidate
+                payload["review_decision"] = normalized_review
+            else:
+                payload["review_decision"] = normalized_review
+
+        review_allows_promotion = bool(
+            review_validated
+            and str(review_validated.get("decision") or "").strip().lower() == "approve"
+            and bool(review_validated.get("promotion_readiness"))
+        )
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        conversion_aligned = _candidate_mentions_success_target(payload, objective)
+        has_cohort_evidence = _candidate_has_cohort_evidence(payload)
+        promotion_block_reason = ""
+        if requested_promoted and not review_allows_promotion:
+            promotion_block_reason = "promotion_requires_approved_review_decision"
+        elif requested_promoted and not conversion_aligned:
+            promotion_block_reason = "candidate_missing_success_target_alignment"
+        elif requested_promoted and not has_cohort_evidence:
+            promotion_block_reason = "candidate_missing_cohort_evidence"
+        is_promoted = requested_promoted and not promotion_block_reason
+        if promotion_block_reason:
+            payload["promoted"] = False
+            payload["status"] = "candidate"
+            payload["promotion_block_reason"] = promotion_block_reason
+        model_cls = PromotedSignal if is_promoted else CandidateSignalDraft
+        ok, validated = _safe_model_validate(model_cls, payload)
+        if not ok:
+            state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+            return validated
+
+        candidate_record = _build_candidate_record(validated)
+        candidate_record["status"] = "promoted" if is_promoted else str(candidate_record.get("status") or "candidate")
+        if review_validated:
+            candidate_record["review_decision"] = review_validated
+            candidate_record["review_status"] = str(review_validated.get("decision") or "")
+        _replace_candidate_record(state, candidate_record)
+        _register_candidate_fingerprints(state, candidate_record)
+        state["last_candidate_signal_id"] = str(candidate_record.get("candidate_id") or "")
+        _sync_candidate_compatibility_lists(state)
+        _record_artifact(state, "candidate_hypotheses", validated, append=True)
+
+        if review_validated:
+            state.setdefault("review_decisions", []).append(review_validated)
+            _record_artifact(state, "review_decisions", review_validated, append=True)
+
+        execution_payload = payload.get("execution_outcome")
+        if isinstance(execution_payload, dict):
+            exec_ok, exec_validated = _safe_model_validate(ExecutionOutcome, execution_payload)
+            if exec_ok:
+                exec_validated["candidate_id"] = state.get("last_candidate_signal_id") or ""
+                state.setdefault("signal_execution_summaries", []).append(exec_validated)
+                state.setdefault("execution_summaries", []).append(exec_validated)
+                _record_artifact(state, "execution_summaries", exec_validated, append=True)
+
+        if is_promoted:
+            promoted_ok, promoted_validated = _safe_model_validate(PromotedSignal, payload)
+            if not promoted_ok:
+                state["non_query_failure_count"] = int(state.get("non_query_failure_count") or 0) + 1
+                return promoted_validated
+            state.setdefault("promoted_signals", []).append(promoted_validated)
+            _record_artifact(state, "promoted_signal_specs", promoted_validated, append=True)
+            result = {"ok": True, "stored_as": "promoted_signal", "name": promoted_validated.get("name")}
+            _tool_cache_set(state, "store_candidate_signal", args_payload, result)
+            return result
+        result = {"ok": True, "stored_as": "candidate_hypothesis", "name": validated.get("name")}
+        if promotion_block_reason:
+            result["promotion_blocked"] = True
+            result["promotion_block_reason"] = promotion_block_reason
+        _tool_cache_set(state, "store_candidate_signal", args_payload, result)
+        return result
+    except Exception as exc:
+        return _tool_exception("store_candidate_signal", exc, state)
+
+
+def load_existing_signals(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    promoted = state.get("promoted_signals") or []
+    if promoted:
+        for signal in promoted:
+            if isinstance(signal, dict):
+                _register_candidate_fingerprints(state, signal)
+        return {"ok": True, "count": len(promoted), "signals": promoted}
+    run_dir = _run_dir(state)
+    path = run_dir / "promoted_signal_specs.jsonl"
+    if not path.exists():
+        return {"ok": True, "count": 0, "signals": []}
+    signals: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            signals.append(json.loads(line))
+        except Exception:
+            continue
+    state["promoted_signals"] = signals
+    for signal in signals:
+        if isinstance(signal, dict):
+            _register_candidate_fingerprints(state, signal)
+    return {"ok": True, "count": len(signals), "signals": signals}
+
+
+def apply_latest_review_decision_to_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        review_payload = _safe_json_loads(state.get("signal_reviewer_iteration"))
+        if not review_payload:
+            return {"ok": True, "status": "no_review_payload"}
+        candidate_id = str(review_payload.get("candidate_id") or state.get("last_candidate_signal_id") or "").strip()
+        if not candidate_id:
+            return {"ok": True, "status": "missing_candidate_id"}
+        apply_key = f"{candidate_id}:{_stable_hash(review_payload)}"
+        applied_keys = state.setdefault("review_applied_keys", [])
+        if apply_key in applied_keys:
+            return {"ok": True, "status": "already_applied", "candidate_id": candidate_id}
+        candidate_record = _find_candidate_record(state, candidate_id)
+        if candidate_record is None:
+            return {"ok": True, "status": "candidate_not_found", "candidate_id": candidate_id}
+
+        normalized_review = _normalize_review_decision(review_payload)
+        normalized_review["candidate_id"] = candidate_id
+        if "confidence" in review_payload:
+            normalized_review["confidence"] = _coerce_float(review_payload.get("confidence"), 0.0)
+        review_ok, review_validated = _safe_model_validate(ReviewDecision, normalized_review)
+        review_entry = review_validated if review_ok else normalized_review
+
+        decision = str(review_entry.get("decision") or "reject").lower()
+        promotion_ready = bool(review_entry.get("promotion_readiness"))
+        is_promoted = decision == "approve" and promotion_ready
+
+        candidate_record["review_decision"] = review_entry
+        candidate_record["review_status"] = decision
+        candidate_record["review_applied_at"] = _utc_now()
+        candidate_record["status"] = "promoted" if is_promoted else "rejected"
+        candidate_record["promoted"] = is_promoted
+        _replace_candidate_record(state, candidate_record)
+        _register_candidate_fingerprints(state, candidate_record)
+        state["latest_pending_candidate_for_review"] = {}
+        _append_unique_state_item(state, "review_decisions", review_entry, dedupe_key="candidate_id")
+        _record_artifact(state, "review_decisions", review_entry, append=True)
+
+        if is_promoted:
+            promoted_payload = {
+                **candidate_record,
+                "promoted": True,
+                "status": "promoted",
+            }
+            promoted_ok, promoted_validated = _safe_model_validate(PromotedSignal, promoted_payload)
+            if promoted_ok:
+                _append_unique_state_item(state, "promoted_signals", promoted_validated, dedupe_key="candidate_id")
+                _record_artifact(state, "promoted_signal_specs", promoted_validated, append=True)
+        else:
+            rejection_payload = {
+                "candidate_id": candidate_id,
+                "status": "rejected",
+                "reasons": _normalize_list_items(review_entry.get("reasons"), limit=8),
+                "required_fixes": _normalize_list_items(review_entry.get("required_fixes"), limit=8),
+            }
+            _append_unique_state_item(state, "rejected_signals", rejection_payload, dedupe_key="candidate_id")
+
+        applied_keys.append(apply_key)
+        state["last_applied_review_candidate_id"] = candidate_id
+        _sync_candidate_compatibility_lists(state)
+        _record_artifact(state, "candidate_hypotheses", candidate_record, append=True)
+        return {
+            "ok": True,
+            "status": candidate_record.get("status"),
+            "candidate_id": candidate_id,
+        }
+    except Exception as exc:
+        return _tool_exception("apply_latest_review_decision_to_state", exc, state)
+
+
+def store_warehouse_profile(profile: Dict[str, Any], tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        payload = dict(profile or {})
+        args_payload = {"profile": payload}
+        cached = _tool_cache_get(state, "store_warehouse_profile", args_payload)
+        if cached is not None:
+            return cached
+        payload.setdefault("captured_at", _utc_now())
+        payload.setdefault("session_id", str(state.get("session_id") or ""))
+        payload.setdefault("available_tables", list(state.get("allowed_tables") or []))
+        if not payload.get("primary_events_table"):
+            event_tables = payload.get("event_tables")
+            if isinstance(event_tables, list) and event_tables and isinstance(event_tables[0], dict):
+                payload["primary_events_table"] = str(event_tables[0].get("table_name") or "")
+        if not payload.get("primary_persons_table"):
+            person_tables = payload.get("person_tables")
+            if isinstance(person_tables, list) and person_tables and isinstance(person_tables[0], dict):
+                payload["primary_persons_table"] = str(person_tables[0].get("table_name") or "")
+        if not payload.get("inferred_time_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                time_cols = likely.get("time")
+                if isinstance(time_cols, list) and time_cols:
+                    payload["inferred_time_column"] = str(time_cols[0])
+        if not payload.get("inferred_event_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                event_cols = likely.get("event")
+                if isinstance(event_cols, list) and event_cols:
+                    payload["inferred_event_column"] = str(event_cols[0])
+        if not payload.get("inferred_distinct_id_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                person_cols = likely.get("person")
+                if isinstance(person_cols, list) and person_cols:
+                    payload["inferred_distinct_id_column"] = str(person_cols[0])
+        if not payload.get("inferred_session_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                session_cols = likely.get("session")
+                if isinstance(session_cols, list) and session_cols:
+                    payload["inferred_session_column"] = str(session_cols[0])
+        if not payload.get("inferred_group_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                group_cols = likely.get("group")
+                if isinstance(group_cols, list) and group_cols:
+                    payload["inferred_group_column"] = str(group_cols[0])
+        if not payload.get("inferred_properties_column"):
+            likely = payload.get("likely_semantic_columns")
+            if isinstance(likely, dict):
+                prop_cols = likely.get("properties")
+                if isinstance(prop_cols, list) and prop_cols:
+                    payload["inferred_properties_column"] = str(prop_cols[0])
+        objective = state.get("signal_objective") if isinstance(state.get("signal_objective"), dict) else {}
+        if objective:
+            if not payload.get("success_event_name"):
+                payload["success_event_name"] = str(objective.get("success_event_name") or "")
+            if payload.get("success_event_confidence") in (None, ""):
+                payload["success_event_confidence"] = _coerce_float(objective.get("success_event_confidence"), 0.0)
+            if payload.get("success_fallback_used") in (None, ""):
+                payload["success_fallback_used"] = bool(objective.get("success_fallback_used"))
+            if payload.get("failure_inactivity_days") in (None, ""):
+                payload["failure_inactivity_days"] = _coerce_int(objective.get("failure_inactivity_days"), 7)
+            if payload.get("success_overrides_failure") in (None, ""):
+                payload["success_overrides_failure"] = bool(objective.get("success_overrides_failure", True))
+        ok, validated = _safe_model_validate(WarehouseProfile, payload)
+        if not ok:
+            return validated
+        state["warehouse_profile"] = validated
+        _record_artifact(state, "warehouse_profile", validated, append=False)
+        result = {"ok": True, "warehouse_profile": validated}
+        _tool_cache_set(state, "store_warehouse_profile", args_payload, result)
+        return result
+    except Exception as exc:
+        return _tool_exception("store_warehouse_profile", exc, state)
+
+
+def dedupe_candidate(sql_or_semantics: str, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    normalized = _normalize_sql_value(sql_or_semantics)
+    existing = state.get("candidate_signals") or state.get("candidate_hypotheses") or []
+    duplicates = []
+    for idx, item in enumerate(existing):
+        if not isinstance(item, dict):
+            continue
+        haystacks = [
+            _normalize_sql_value(str(item.get("query_template") or "")),
+            _normalize_sql_value(str(item.get("sql") or "")),
+            _normalize_sql_value(str(item.get("interpretation") or "")),
+            _normalize_sql_value(str(item.get("name") or "")),
+        ]
+        if normalized and normalized in haystacks:
+            duplicates.append(idx)
+    return {"ok": True, "is_duplicate": bool(duplicates), "duplicate_indexes": duplicates}
+
+
+def _shift_param_dates(param_set: Dict[str, Any], shift_days: int) -> Dict[str, Any]:
+    shifted = dict(param_set or {})
+    for key, value in list(shifted.items()):
+        if not isinstance(value, str):
+            continue
+        dt: Optional[datetime] = None
+        out_format = ""
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                out_format = "%Y-%m-%d"
+            except Exception:
+                dt = None
+        elif re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", value):
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                out_format = "%Y-%m-%d %H:%M:%S"
+            except Exception:
+                dt = None
+        if dt is None:
+            continue
+        shifted[key] = (dt + timedelta(days=shift_days)).strftime(out_format)
+    return shifted
+
+
+def _render_template(template: str, params: Dict[str, Any]) -> str:
+    rendered = str(template or "")
+    for key, value in (params or {}).items():
+        replacement = str(value)
+        rendered = rendered.replace(f"{{{{{key}}}}}", replacement)
+        rendered = rendered.replace(f"{{{key}}}", replacement)
+        rendered = rendered.replace(f"%({key})s", replacement)
+    return rendered
+
+
+def _find_unresolved_template_tokens(sql: str) -> List[str]:
+    unresolved: List[str] = []
+    for match in re.findall(r"%\(([a-zA-Z_][a-zA-Z0-9_]*)\)s", sql or ""):
+        unresolved.append(match)
+    for match in re.findall(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}", sql or ""):
+        unresolved.append(match)
+    for match in re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", sql or ""):
+        unresolved.append(match)
+    return sorted(set(unresolved))
+
+
+def rerun_promoted_signals(holdout_shift_days: int = 14, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    promoted = state.get("promoted_signals") or []
+    if not promoted:
+        return {"ok": True, "rerun_count": 0, "successful": 0, "results": []}
+
+    reruns: List[Dict[str, Any]] = []
+    successful = 0
+    for signal in promoted:
+        if not isinstance(signal, dict):
+            continue
+        query_template = str(signal.get("query_template") or "")
+        parameter_set = signal.get("parameter_set") or {}
+        shifted = _shift_param_dates(parameter_set, int(holdout_shift_days))
+        sql = _render_template(query_template, shifted)
+        unresolved_tokens = _find_unresolved_template_tokens(sql)
+        if unresolved_tokens:
+            rerun_entry = {
+                "name": signal.get("name"),
+                "shift_days": int(holdout_shift_days),
+                "params": shifted,
+                "ok": False,
+                "row_count": 0,
+                "error": "unresolved_template_parameters",
+                "unresolved_tokens": unresolved_tokens,
+            }
+            reruns.append(rerun_entry)
+            _record_artifact(state, "holdout_rerun_results", rerun_entry, append=True)
+            continue
+        result = run_readonly_query(
+            sql=sql,
+            purpose=f"holdout_rerun:{signal.get('name') or 'signal'}",
+            expected_grain=str(signal.get("entity_grain") or ""),
+            session_id=str(state.get("session_id") or ""),
+            tool_context=tool_context,
+        )
+        rerun_entry = {
+            "name": signal.get("name"),
+            "shift_days": int(holdout_shift_days),
+            "params": shifted,
+            "ok": bool(result.get("ok")),
+            "row_count": int(result.get("row_count") or 0),
+            "error": result.get("error"),
+        }
+        if rerun_entry["ok"] and rerun_entry["row_count"] > 0:
+            successful += 1
+        reruns.append(rerun_entry)
+        _record_artifact(state, "holdout_rerun_results", rerun_entry, append=True)
+
+    state["holdout_rerun_results"] = reruns
+    return {"ok": True, "rerun_count": len(reruns), "successful": successful, "results": reruns}
+
+
+def get_loop_status(tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        limits = state.get("loop_limits") or {}
+        max_iterations = int(limits.get("max_iterations") or _to_int_env("SIGNAL_AGENT_MAX_ITERATIONS", 8))
+        target_promoted = int(limits.get("target_promoted_signals") or _to_int_env("SIGNAL_AGENT_TARGET_PROMOTED", 3))
+        max_failures = int(limits.get("too_many_failures") or _to_int_env("SIGNAL_AGENT_MAX_FAILURES", 5))
+        min_iterations_before_exit = _to_int_env("SIGNAL_AGENT_MIN_ITERATIONS_BEFORE_EXIT", 3)
+        iteration = int(state.get("iteration_index") or 0) + 1
+        state["iteration_index"] = iteration
+        promoted_count = len(state.get("promoted_signals") or [])
+        failures = int(state.get("failure_count") or 0)
+        query_count = int(state.get("query_count") or 0)
+        llm_calls_used_estimate = max(int(state.get("llm_calls_used_estimate") or 0), (iteration * 3) + 1)
+        state["llm_calls_used_estimate"] = llm_calls_used_estimate
+        reached_limits = (
+            iteration >= max_iterations
+            or promoted_count >= target_promoted
+            or failures >= max_failures
+        )
+        should_exit = reached_limits and iteration >= min_iterations_before_exit
+        reason = "continue"
+        if reached_limits and iteration < min_iterations_before_exit:
+            reason = "continue_min_iterations_guard"
+        elif iteration >= max_iterations:
+            reason = "max_iterations_reached"
+        elif promoted_count >= target_promoted:
+            reason = "target_promoted_signals_reached"
+        elif failures >= max_failures:
+            reason = "too_many_failures"
+        status_payload = {
+            "ok": True,
+            "at": _utc_now(),
+            "iteration_index": iteration,
+            "promoted_count": promoted_count,
+            "failure_count": failures,
+            "non_query_failure_count": int(state.get("non_query_failure_count") or 0),
+            "query_count": query_count,
+            "llm_calls_used_estimate": llm_calls_used_estimate,
+            "limits": {
+                "max_iterations": max_iterations,
+                "target_promoted_signals": target_promoted,
+                "too_many_failures": max_failures,
+                "min_iterations_before_exit": min_iterations_before_exit,
+            },
+            "should_exit": should_exit,
+            "reason": reason,
+        }
+        state["last_loop_status"] = status_payload
+        state.setdefault("loop_iteration_events", []).append(status_payload)
+        _record_artifact(state, "loop_iteration_events", status_payload, append=True)
+        return status_payload
+    except Exception as exc:
+        return _tool_exception("get_loop_status", exc, state)
+
+
+def _summary_markdown(report: Dict[str, Any]) -> str:
+    return (
+        "# Signal Agent Experiment Summary\n\n"
+        f"- Run ID: {report.get('run_id', '')}\n"
+        f"- Candidates proposed: {report.get('candidates_proposed', 0)}\n"
+        f"- Policy blocked: {report.get('policy_blocked', 0)}\n"
+        f"- Reviewer rejected: {report.get('reviewer_rejected', 0)}\n"
+        f"- Executed successfully: {report.get('executed_successfully', 0)}\n"
+        f"- Promoted signals: {report.get('promoted', 0)}\n"
+        f"- Holdout rerun successful: {report.get('rerun_successful', 0)}\n"
+        f"- Holdout rerun success rate: {report.get('rerun_success_rate', 0.0):.2f}\n"
+        f"- Hypothesis passed: {report.get('hypothesis_passed', False)}\n"
+        f"- Stop reason: {report.get('stop_reason', '')}\n"
+        f"- Stop iteration: {report.get('stop_iteration', 0)}\n"
+        f"- Loop iterations observed: {report.get('loop_iterations_observed', 0)}\n"
+        f"- Query count total: {report.get('query_count_total', 0)}\n"
+        f"- LLM calls used (estimate): {report.get('llm_calls_used_estimate', 0)}\n"
+    )
+
+
+def finalize_experiment_report(holdout_shift_days: int = 14, tool_context: Any = None) -> Dict[str, Any]:
+    state = _state_from_context(tool_context)
+    try:
+        args_payload = {"holdout_shift_days": int(holdout_shift_days)}
+        cached = _tool_cache_get(state, "finalize_experiment_report", args_payload)
+        if cached is not None:
+            return cached
+        existing_report = state.get("experiment_report")
+        if isinstance(existing_report, dict) and existing_report.get("run_id"):
+            existing_promoted = existing_report.get("promoted_signals")
+            if not isinstance(existing_promoted, list):
+                existing_promoted = state.get("promoted_signals") or []
+            summary_path = _run_dir(state) / "summary.md"
+            if not summary_path.exists():
+                summary_path.write_text(_summary_markdown(existing_report), encoding="utf-8")
+            result = {
+                "ok": True,
+                "run_id": existing_report.get("run_id"),
+                "promoted_signals": existing_promoted,
+                "experiment_report_metrics": {
+                    "candidates_proposed": existing_report.get("candidates_proposed", 0),
+                    "policy_blocked": existing_report.get("policy_blocked", 0),
+                    "reviewer_rejected": existing_report.get("reviewer_rejected", 0),
+                    "executed_successfully": existing_report.get("executed_successfully", 0),
+                    "promoted": existing_report.get("promoted", 0),
+                    "rerun_successful": existing_report.get("rerun_successful", 0),
+                    "rerun_success_rate": existing_report.get("rerun_success_rate", 0.0),
+                    "hypothesis_passed": existing_report.get("hypothesis_passed", False),
+                },
+                "experiment_report": existing_report,
+                "summary_path": str(summary_path),
+                "cached_call": True,
+            }
+            _tool_cache_set(state, "finalize_experiment_report", args_payload, result)
+            return result
+
+        rerun = rerun_promoted_signals(holdout_shift_days=holdout_shift_days, tool_context=tool_context)
+        candidates = state.get("candidate_signals") or state.get("candidate_hypotheses") or []
+        policy_validations = state.get("policy_validations") or []
+        reviews = state.get("review_decisions") or []
+        executions = state.get("signal_execution_summaries") or state.get("execution_summaries") or []
+        promoted = state.get("promoted_signals") or []
+        rerun_results = state.get("holdout_rerun_results") or []
+        loop_events = state.get("loop_iteration_events") or []
+        last_loop_status = state.get("last_loop_status") or {}
+        quota_exhausted_error = str(state.get("quota_exhausted_error") or "").strip()
+        loop_iterations_observed = max(len(loop_events), len(candidates))
+        fallback_stop_iteration = loop_iterations_observed
+        fallback_stop_reason = "loop_exhausted_max_iterations" if loop_iterations_observed else "loop_not_started"
+        llm_calls_used_estimate = int(state.get("llm_calls_used_estimate") or 0)
+        if llm_calls_used_estimate <= 0 and loop_iterations_observed:
+            # Each iteration runs explorer + reviewer, plus bootstrap/finalize overhead.
+            llm_calls_used_estimate = (loop_iterations_observed * 2) + 2
+
+        policy_blocked = sum(1 for x in policy_validations if isinstance(x, dict) and not x.get("allowed"))
+        reviewer_rejected = sum(
+            1
+            for x in reviews
+            if isinstance(x, dict) and str(x.get("decision") or "").lower() == "reject"
+        )
+        executed_successfully = sum(
+            1
+            for x in executions
+            if isinstance(x, dict) and str(x.get("status") or "").lower() == "ok"
+        )
+        rerun_successful = sum(
+            1
+            for x in rerun_results
+            if isinstance(x, dict) and x.get("ok") and int(x.get("row_count") or 0) > 0
+        )
+        rerun_success_rate = (rerun_successful / len(promoted)) if promoted else 0.0
+        report_payload = ExperimentReport(
+            run_id=_run_id_from_state(state),
+            generated_at=_utc_now(),
+            candidates_proposed=len(candidates),
+            policy_blocked=policy_blocked,
+            reviewer_rejected=reviewer_rejected,
+            executed_successfully=executed_successfully,
+            promoted=len(promoted),
+            rerun_successful=rerun_successful,
+            rerun_success_rate=rerun_success_rate,
+            hypothesis_passed=(len(promoted) >= 3 and rerun_success_rate >= 0.60),
+            notes=[
+                f"Holdout rerun attempted for {rerun.get('rerun_count', 0)} promoted signals with shift_days={holdout_shift_days}.",
+                "Deterministic SQL policy is enforced in validate_sql_policy and run_readonly_query.",
+            ]
+            + (
+                ["Run hit Gemini resource exhaustion after retries and finalized with partial state preserved."]
+                if quota_exhausted_error
+                else []
+            ),
+        ).model_dump()
+        report_payload["warehouse_profile"] = state.get("warehouse_profile") or {}
+        report_payload["promoted_signals"] = promoted
+        report_payload["holdout_rerun_results"] = rerun_results
+        report_payload["stop_reason"] = str(last_loop_status.get("reason") or fallback_stop_reason)
+        report_payload["stop_iteration"] = int(last_loop_status.get("iteration_index") or fallback_stop_iteration)
+        report_payload["loop_iterations_observed"] = loop_iterations_observed
+        report_payload["query_count_total"] = int(state.get("query_count") or 0)
+        report_payload["llm_calls_used_estimate"] = llm_calls_used_estimate
+        if quota_exhausted_error:
+            report_payload["quota_exhausted_error"] = quota_exhausted_error
+        state["experiment_report"] = report_payload
+        _record_artifact(state, "experiment_report", report_payload, append=False)
+
+        summary_path = _run_dir(state) / "summary.md"
+        summary_path.write_text(_summary_markdown(report_payload), encoding="utf-8")
+        result = {
+            "ok": True,
+            "run_id": report_payload.get("run_id"),
+            "promoted_signals": promoted,
+            "experiment_report_metrics": {
+                "candidates_proposed": report_payload.get("candidates_proposed", 0),
+                "policy_blocked": report_payload.get("policy_blocked", 0),
+                "reviewer_rejected": report_payload.get("reviewer_rejected", 0),
+                "executed_successfully": report_payload.get("executed_successfully", 0),
+                "promoted": report_payload.get("promoted", 0),
+                "rerun_successful": report_payload.get("rerun_successful", 0),
+                "rerun_success_rate": report_payload.get("rerun_success_rate", 0.0),
+                "hypothesis_passed": report_payload.get("hypothesis_passed", False),
+                "stop_reason": report_payload.get("stop_reason", ""),
+                "stop_iteration": report_payload.get("stop_iteration", 0),
+                "loop_iterations_observed": report_payload.get("loop_iterations_observed", 0),
+                "query_count_total": report_payload.get("query_count_total", 0),
+                "llm_calls_used_estimate": report_payload.get("llm_calls_used_estimate", 0),
+            },
+            "experiment_report": report_payload,
+            "summary_path": str(summary_path),
+        }
+        _tool_cache_set(state, "finalize_experiment_report", args_payload, result)
+        return result
+    except Exception as exc:
+        return _tool_exception("finalize_experiment_report", exc, state)
