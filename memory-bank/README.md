@@ -11,6 +11,7 @@ Reference knowledge for the Inspector ML agent. Each file is a self-contained gu
 | `rice-prioritization.md` | Scoring and ranking hypotheses, features, or experiments by expected impact |
 | `monetization-pricing.md` | Analyzing pricing strategy, willingness to pay, CAC payback, cost of revenue, packaging decisions |
 | `cohort-retention-analysis.md` | Building retention reports from PostHog data, comparing N-day vs rolling retention, computing moving averages across cohorts |
+| `business-models-value-metrics.md` | Mapping business models to value metrics and target events for signal discovery — which events matter for seat-based vs usage-based vs transaction-based companies |
 
 ## How to use
 
