@@ -21,8 +21,12 @@ if AGENTOPS_API_KEY:
 from shared.cache import cache_read_json, cache_write_json
 from shared.inspector import inspector_env, inspector_post
 from shared.model_factory import build_gemini
+from shared.skills import build_skill_toolset
 
 MODEL = build_gemini("UPSELL_AGENT_MODEL", "gemini-3-flash-preview")
+
+_SKILL_TOOLSET = build_skill_toolset()
+_SKILL_TOOLS: List[Any] = [_SKILL_TOOLSET] if _SKILL_TOOLSET is not None else []
 
 
 class _HomepageExtractor(HTMLParser):
@@ -390,6 +394,9 @@ upsell_worker = Agent(
     model=MODEL,
     name="upsell_worker",
     description="Explores user company context and captures website summary context.",
+    generate_content_config=types.GenerateContentConfig(
+        response_mime_type="application/json"
+    ),
     tools=[
         fetch_company_homepage,
         emit_website_summary,
@@ -439,8 +446,14 @@ pipeline_finalize_agent = Agent(
     model=MODEL,
     name="upsell_pipeline_finalize",
     description="Assembles the end-to-end upsell pipeline output.",
-    tools=[emit_pipeline_report],
+    generate_content_config=types.GenerateContentConfig(
+        response_mime_type="application/json"
+    ),
+    tools=[emit_pipeline_report, *_SKILL_TOOLS],
     instruction=(
+        "You have access to expert skill tools (list_skills, load_skill, load_skill_resource).\n"
+        "Before finalizing, call list_skills once and load any skill that would help you frame\n"
+        "the output. Do not load the same skill more than once.\n\n"
         "You finalize the stitched upsell pipeline output.\n"
         "Call emit_pipeline_report exactly once.\n"
         "Return JSON only.\n"

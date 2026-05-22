@@ -153,7 +153,6 @@ def _state_from_context(tool_context: Any) -> Dict[str, Any]:
     state.setdefault("tool_call_cache", {})
     state.setdefault("last_loop_status", {})
     state.setdefault("signal_context_digest", {})
-    state.setdefault("signal_context_warnings", [])
     state.setdefault("candidate_signals", [])
     state.setdefault("candidate_fingerprints", {})
     state.setdefault("signal_execution_summaries", [])
@@ -270,7 +269,6 @@ def initialize_signal_run(
         state["signal_objective"] = {}
         state["latest_event_profile"] = {}
         state["signal_context_digest"] = {}
-        state["signal_context_warnings"] = []
         state["candidate_signals"] = []
         state["candidate_fingerprints"] = {}
         state["signal_execution_summaries"] = []
@@ -1444,8 +1442,6 @@ def prepare_signal_inputs(
     if not final_profile_result.get("ok"):
         return final_profile_result
 
-    playbook = build_signal_playbook_snippets()
-    state["signal_context_warnings"] = list(playbook.get("warnings") or [])
     table_summaries: List[Dict[str, Any]] = []
     for table in _upstream_table_summaries(state)[:8]:
         identity = _table_identity(table)
@@ -1488,7 +1484,6 @@ def prepare_signal_inputs(
         },
         "existing_signal_fingerprints": fingerprint_values,
         "loop_limits": dict(state.get("loop_limits") or {}),
-        "playbook_snippets": list(playbook.get("playbook_snippets") or []),
     }
 
     result = {
@@ -1501,7 +1496,6 @@ def prepare_signal_inputs(
         "profile_events_status": "ok" if profile_events_result.get("ok") else profile_events_result.get("status", "skipped"),
         "source_table_count": bridge.get("source_table_count", 0),
         "signal_context_digest": state.get("signal_context_digest") or {},
-        "prep_warnings": list(state.get("signal_context_warnings") or []),
     }
     state["prepared_signal_inputs"] = result
     return result
@@ -1553,10 +1547,6 @@ def _normalize_review_decision(review_payload: Dict[str, Any]) -> Dict[str, Any]
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
-
-
-def _memory_bank_dir() -> Path:
-    return _repo_root() / "memory-bank"
 
 
 def _candidate_id() -> str:
@@ -1724,63 +1714,6 @@ def _append_unique_state_item(state: Dict[str, Any], key: str, payload: Dict[str
                 if isinstance(item, dict) and str(item.get(dedupe_key) or "") == dedupe_value:
                     return
     items.append(payload)
-
-
-def select_memory_bank_guides() -> List[Dict[str, Any]]:
-    return [
-        {"path": "monetization-pricing.md", "topics": ["value_metric", "expansion_revenue", "seat_expansion", "tier_upgrade", "ndr"]},
-        {"path": "cohort-retention-analysis.md", "topics": ["retention", "frequency", "power_users", "disengagement"]},
-        {"path": "rice-prioritization.md", "topics": ["reach", "impact", "confidence", "ranking"]},
-        {"path": "founding-sales.md", "topics": ["icp", "pain", "cost", "proof"]},
-        {"path": "running-lean.md", "topics": ["actionable_metrics", "vanity_metrics", "cohort_analysis"]},
-        {"path": "hypotheses-generation.md", "topics": ["icp", "pain", "cost", "proof"]},
-    ]
-
-
-def load_memory_bank_snippets(selected_guides: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    snippets: List[Dict[str, Any]] = []
-    warnings: List[str] = []
-    base_dir = _memory_bank_dir()
-    guides = selected_guides or select_memory_bank_guides()
-    if not base_dir.exists():
-        return {"snippets": [], "warnings": ["memory_bank_missing"]}
-    for guide in guides:
-        rel_path = str(guide.get("path") or "").strip()
-        if not rel_path:
-            continue
-        path = base_dir / rel_path
-        if not path.exists():
-            warnings.append(f"missing:{rel_path}")
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception:
-            warnings.append(f"unreadable:{rel_path}")
-            continue
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        heading = next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.stem.replace("-", "_"))
-        body_lines = [line for line in lines if not line.startswith("#")][:8]
-        content = " ".join(body_lines)
-        if len(content) > 420:
-            content = content[:417].rstrip() + "..."
-        topic = str((guide.get("topics") or ["general"])[0])
-        snippets.append(
-            {
-                "source": f"memory-bank/{rel_path}",
-                "topic": topic,
-                "content": f"{heading}: {content}".strip(),
-                "use_for": list(guide.get("topics") or [])[:4],
-            }
-        )
-    return {"snippets": snippets, "warnings": warnings}
-
-
-def build_signal_playbook_snippets() -> Dict[str, Any]:
-    loaded = load_memory_bank_snippets()
-    return {
-        "playbook_snippets": loaded.get("snippets") or [],
-        "warnings": loaded.get("warnings") or [],
-    }
 
 
 def _candidate_mentions_success_target(payload: Dict[str, Any], objective: Dict[str, Any]) -> bool:
