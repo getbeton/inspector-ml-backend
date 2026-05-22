@@ -1,19 +1,7 @@
 ---
 name: founding-sales
-description: Compact sales playbook subset — the seven-step problem-solution narrative, ICP qualification (pain owner, budget authority, size threshold, industry fit), and standard early-stage pipeline stages with closed-lost capture. Use when a signal needs to be framed in sales-team-actionable terms — qualifying the right contact, sequencing the narrative, or capturing closed-lost reasons for the funnel.
+description: Ideal Customer Profile (ICP) qualification for early-stage B2B SaaS — identifying the pain owner, budget authority, minimum organization size, and industry fit for a candidate signal. Use when a signal needs to be tied to a specific buyer persona, or when validating that a user attribute meaningfully narrows the addressable audience.
 ---
-
-## Problem-solution sales narrative
-
-Build your narrative in this order. Each part builds on the previous one. If the prospect disagrees at any step, stop and address it — don't pitch past a dead audience.
-
-1. **What is the problem?** — Articulate the business pain crisply. Test: pose it to someone in the industry — they should say "yes" and want to dig deeper.
-2. **Who has it?** — Identify the person with functional responsibility and budget authority. Titles matter for targeting.
-3. **What are the costs?** — Hard ROI (direct cost savings) and soft ROI (opportunity cost of non-solution). Understand unit economics of the problem.
-4. **How is it currently solved?** — Four levels: no solution, solution via process, solution via service providers, solution via product. Know each path and its weaknesses — but also its strengths, for credibility.
-5. **What has changed?** — A technology shift, market shift, or regulatory change that makes a new solution possible or necessary.
-6. **How does the new solution work?** — Explain by comparison to what the prospect already understands. Keep it simple.
-7. **Proof** — Quantitative (metrics that beat existing solutions on their own terms) + qualitative (testimonials, case studies, press). Third-party validation.
 
 ## Ideal Customer Profile (ICP)
 
@@ -25,12 +13,6 @@ Match a company with your ICP by answering:
 - **Industry/vertical fit** — Where is the pain most acute and your proof strongest?
 
 Qualification check: If the contact can say "that's not really my job," you have the wrong person. Target the person who spends meaningful time daily resolving the pain.
-
-## Pipeline stages
-
-Standard early-stage pipeline: Prospect identified -> Outreach sent -> Demo scheduled -> Demo completed -> Proposal/negotiation -> Closed-won / Closed-lost.
-
-For every closed-lost: record the reason (budget, timing, competition, feature gap, wrong contact). Share it. Learn from it. Come back later.
 
 ## Source
 

@@ -36,6 +36,8 @@ The unit of consumption your pricing is based on. This is the single most import
 
 To identify the value metric: ask "what does the customer get more of when they succeed with our product?". This is what they're actually paying for and what they'll use to normalize the price per unit they compare among vendors.
 
+Understanding of value metric is crucial to know why users might want to upgrade at all. You can get it by reading customer's website pages, especially pricing structure.
+
 Once you've identified the value metric, it's worth segmenting users by their price elasticity.
 
 ## Willingness to pay (WTP)

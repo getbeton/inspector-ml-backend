@@ -3,7 +3,7 @@ name: cohort-retention-analysis
 description: PostHog cohort and retention analysis playbook — defining cohorts, choosing between N-day and rolling retention, interpreting retention curves, and connecting retention shape to product health diagnoses (habit formation, pre-churn, power-user emergence). Use when proposing or reviewing retention-style signals, when designing cohort-based SQL, or when reading retention curves for diagnosis. Load the references/retention-metrics.md resource for the six concrete comparison dimensions and the moving-median formula.
 ---
 
-A theoretical guide for measuring and comparing user retention across cohorts. Apply these concepts when querying PostHog data to produce retention reports.
+A theoretical guide for measuring and comparing user retention across cohorts. Apply these concepts when querying PostHog data to produce or analyze retention reports.
 
 ## What is a cohort?
 
@@ -14,6 +14,8 @@ It usually makes sense to look at least at 1-2 different temporal windows. They 
 You can also combine temporal resolution (to account for changes in external environment like growth of traffic prices or new campaigns launched) and qualitative dimensions (e.g. traffic channel or customer size).
 
 Sometimes you also combine different events – e.g. match people with cohorts based on **signup date** but calculate share of users who did a **purchase** on Nth week.
+
+In this example, retention based on signup date would show retention of *all* users, while retention based on first purchase data would show retention of buyers only. The difference is that the former will show how many users that came during particular period converted to first purchase at all after N periods, while the latter would track conversion of *repeated* purchase after N periods.
 
 ## Two types of retention
 

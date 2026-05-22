@@ -40,9 +40,7 @@ Current example: `cohort-retention-analysis/` keeps the conceptual framing in `S
 
 ## What each skill is for
 
-- `rice-prioritization/` — Score and rank candidate signals or hypotheses by Reach x Impact x Confidence / Effort.
-- `hypotheses-generation/` — Founding-sales playbook (Kazanjy) for framing sales-actionable hypotheses in pre-PMF B2B SaaS.
 - `cohort-retention-analysis/` — PostHog cohort/retention playbook with conceptual framing in SKILL.md and concrete metric formulas in references/retention-metrics.md.
 - `monetization-pricing/` — Verna/Reforge monetization framework (value metric, WTP, CAC, LTV:CAC, NDR).
-- `founding-sales/` — Compact subset of the sales playbook focused on problem-solution narrative, ICP qualification, and pipeline stages.
-- `running-lean/` — Maurya's Lean Canvas, three stages, experiment design, and actionable-vs-vanity metrics.
+- `founding-sales/` — ICP qualification (pain owner, budget authority, size threshold, industry fit) from Kazanjy's playbook.
+- `running-lean/` — Maurya's Lean Canvas, prioritization, experiment design, and actionable-vs-vanity metrics.

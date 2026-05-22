@@ -452,8 +452,8 @@ pipeline_finalize_agent = Agent(
     tools=[emit_pipeline_report, *_SKILL_TOOLS],
     instruction=(
         "You have access to expert skill tools (list_skills, load_skill, load_skill_resource).\n"
-        "Before finalizing, call list_skills once and load any skill that would help you rank\n"
-        "or frame the output (e.g. rice-prioritization). Do not load the same skill more than once.\n\n"
+        "Before finalizing, call list_skills once and load any skill that would help you frame\n"
+        "the output. Do not load the same skill more than once.\n\n"
         "You finalize the stitched upsell pipeline output.\n"
         "Call emit_pipeline_report exactly once.\n"
         "Return JSON only.\n"
