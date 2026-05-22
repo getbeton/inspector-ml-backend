@@ -287,6 +287,7 @@ explorer_agent = LlmAgent(
         "- Do not join events.distinct_id to persons.id (String vs UUID mismatch risk in Inspector/PostHog).\n"
         "- Prefer events.distinct_id as person-level grain unless a compatible persons key is explicitly verified.\n"
         "- Do not use blocked functions/patterns: arrayJoin, numbers*, remote*, url(), CROSS JOIN, INTO OUTFILE, LOAD_FILE.\n"
+        "- Do not append a SETTINGS clause (e.g. `SETTINGS allow_experimental_analyzer=1`). PostHog HogQL does not support it and rejects the query with `Unsupported: SelectStmt.settingsClause()`.\n"
         "- For recent vs baseline comparisons, use a single SELECT with conditional aggregation.\n"
         "- Do not call schema discovery tools in this stage; bootstrap already handled schema discovery.\n"
         "- Do not spend query budget on rediscovery checks such as top events, date range scans, event existence checks, or generic top pages.\n"
