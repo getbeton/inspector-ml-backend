@@ -1,3 +1,9 @@
+# LLM routing + telemetry (litellm adapter, Langfuse alongside AgentOps).
+# Left unpinned to resolve against google-adk 1.19.0; pin after first build.
+litellm
+langfuse
+openinference-instrumentation-google-adk
+anthropic
 agentops==0.4.21
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2

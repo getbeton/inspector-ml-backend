@@ -2,18 +2,18 @@ import os
 import random
 from typing import Any, Dict, List
 
-import agentops
 from shared.inspector import inspector_env, inspector_post
 from google.adk.agents.llm_agent import Agent
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
-from shared.model_factory import build_gemini
+from shared.model_factory import build_model
+from shared.observability import init_observability
 
-AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
-if AGENTOPS_API_KEY:
-    agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
+# ADK loads each agent module directly without importing the v0.0.2 package
+# __init__.py, so wire AgentOps + Langfuse observability at agent-import time.
+init_observability()
 
-MODEL = build_gemini("DWH_ANALYST_MODEL", "gemini-3-flash-preview")
+MODEL = build_model("DWH_ANALYST_MODEL", "gemini-3-flash-preview")
 
 from .tools import inspector_dwh_eda
 

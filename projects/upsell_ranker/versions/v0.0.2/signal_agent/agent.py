@@ -2,9 +2,9 @@ import inspect
 import os
 from typing import Any, Dict
 
-import agentops
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
-from shared.model_factory import build_gemini
+from shared.model_factory import build_model
+from shared.observability import init_observability
 
 try:
     from google.adk.models.google_llm import _ResourceExhaustedError
@@ -20,12 +20,12 @@ from .tools import (
 )
 from shared.skills import build_skill_toolset
 
-AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
-if AGENTOPS_API_KEY:
-    agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
+# ADK loads each agent module directly without importing the v0.0.2 package
+# __init__.py, so wire AgentOps + Langfuse observability at agent-import time.
+init_observability()
 
-MODEL = build_gemini("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview")
-REVIEWER_MODEL = build_gemini(
+MODEL = build_model("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview")
+REVIEWER_MODEL = build_model(
     "SIGNAL_REVIEWER_MODEL",
     os.getenv("SIGNAL_AGENT_MODEL", "gemini-3-flash-preview"),
 )
