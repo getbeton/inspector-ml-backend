@@ -11,6 +11,16 @@ try:
 except Exception:  # pragma: no cover - runtime compatibility guard
     _ResourceExhaustedError = Exception
 
+# After routing through LiteLLM, 429/quota errors surface as
+# litellm.exceptions.RateLimitError rather than the native ADK
+# _ResourceExhaustedError, so catch both to keep quota handling alive.
+try:
+    from litellm.exceptions import RateLimitError as _LiteLLMRateLimitError
+except Exception:  # pragma: no cover - runtime compatibility guard
+    _LiteLLMRateLimitError = _ResourceExhaustedError
+
+_QUOTA_EXHAUSTED_ERRORS = (_ResourceExhaustedError, _LiteLLMRateLimitError)
+
 from .tools import (
     apply_latest_review_decision_to_state,
     finalize_experiment_report,
@@ -119,7 +129,7 @@ class ScopedLoopAgent(LoopAgent):
                 author = getattr(event, "author", "") or getattr(getattr(event, "invocation_metadata", None), "agent", "")
                 if author == "signal_iteration_pipeline" and ctx is not None and self._should_exit_from_state(ctx):
                     break
-        except _ResourceExhaustedError as exc:
+        except _QUOTA_EXHAUSTED_ERRORS as exc:
             state = getattr(getattr(ctx, "session", None), "state", None)
             if state is not None:
                 detail = str(exc)
