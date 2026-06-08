@@ -7,23 +7,23 @@ from html.parser import HTMLParser
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
-import agentops
 import requests
 from google.adk.agents import SequentialAgent
 from google.adk.agents.llm_agent import Agent
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
-AGENTOPS_API_KEY = os.getenv("AGENTOPS_API_KEY")
-if AGENTOPS_API_KEY:
-    agentops.init(api_key=AGENTOPS_API_KEY, default_tags=["google adk"])
-
 from shared.cache import cache_read_json, cache_write_json
 from shared.inspector import inspector_env, inspector_post
-from shared.model_factory import build_gemini
+from shared.model_factory import build_model
+from shared.observability import init_observability
 from shared.skills import build_skill_toolset
 
-MODEL = build_gemini("UPSELL_AGENT_MODEL", "gemini-3-flash-preview")
+# ADK loads each agent module directly without importing the v0.0.2 package
+# __init__.py, so wire AgentOps + Langfuse observability at agent-import time.
+init_observability()
+
+MODEL = build_model("UPSELL_AGENT_MODEL", "gemini-3-flash-preview")
 
 _SKILL_TOOLSET = build_skill_toolset()
 _SKILL_TOOLS: List[Any] = [_SKILL_TOOLSET] if _SKILL_TOOLSET is not None else []

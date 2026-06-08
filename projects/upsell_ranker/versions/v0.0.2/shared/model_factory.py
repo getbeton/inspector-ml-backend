@@ -1,7 +1,11 @@
 import os
 
-from google.adk.models.google_llm import Gemini
-from google.genai import types
+from google.adk.models.lite_llm import LiteLlm
+
+# Default provider assumed for bare model names (e.g. the legacy
+# "gemini-3-flash-preview" still present in .env.example). LiteLLM requires a
+# "<provider>/<model>" string, so anything without a "/" is routed to Gemini.
+_DEFAULT_PROVIDER = "gemini"
 
 
 def _to_int_env(name: str, default: int) -> int:
@@ -11,22 +15,43 @@ def _to_int_env(name: str, default: int) -> int:
         return default
 
 
-def _to_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
+def _normalize_model(model: str) -> str:
+    """Return a LiteLLM-compatible "<provider>/<model>" string.
+
+    Bare names (no "/") are assumed to be Gemini so existing env values like
+    "gemini-3-flash-preview" keep working unchanged after the switch to
+    LiteLLM. Fully-qualified strings (e.g. "anthropic/claude-opus-4-6",
+    "vertex_ai/gemini-3-flash") pass through untouched.
+    """
+    model = model.strip()
+    if "/" in model:
+        return model
+    return f"{_DEFAULT_PROVIDER}/{model}"
 
 
-def build_gemini(model_env: str, default_model: str) -> Gemini:
-    return Gemini(
-        model=os.getenv(model_env, default_model),
-        retry_options=types.HttpRetryOptions(
-            attempts=_to_int_env("GEMINI_RETRY_ATTEMPTS", 6),
-            initial_delay=_to_float_env("GEMINI_RETRY_INITIAL_DELAY_SEC", 1.0),
-            max_delay=_to_float_env("GEMINI_RETRY_MAX_DELAY_SEC", 90.0),
-            exp_base=_to_float_env("GEMINI_RETRY_EXP_BASE", 2.0),
-            jitter=_to_float_env("GEMINI_RETRY_JITTER", 1.0),
-            http_status_codes=[408, 429, 500, 502, 503, 504],
-        ),
+def _ensure_gemini_api_key() -> None:
+    """LiteLLM's `gemini/` provider authenticates with GEMINI_API_KEY, while
+    the rest of this codebase (and the native ADK Gemini client) uses
+    GOOGLE_API_KEY. Mirror GOOGLE_API_KEY into GEMINI_API_KEY when the latter
+    is unset so the litellm switch doesn't silently break auth.
+    """
+    if not os.getenv("GEMINI_API_KEY"):
+        google_key = os.getenv("GOOGLE_API_KEY")
+        if google_key:
+            os.environ["GEMINI_API_KEY"] = google_key
+
+
+def build_model(model_env: str, default_model: str) -> LiteLlm:
+    """Build a LiteLLM-fronted model for an ADK agent.
+
+    `model_env` is the env var holding the model id; `default_model` is used
+    when it's unset. LiteLLM handles provider routing + retries, replacing the
+    previous native-Gemini-only factory. `num_retries` is passed through to
+    litellm.completion (configurable via LLM_NUM_RETRIES).
+    """
+    _ensure_gemini_api_key()
+    model = _normalize_model(os.getenv(model_env, default_model))
+    return LiteLlm(
+        model=model,
+        num_retries=_to_int_env("LLM_NUM_RETRIES", 6),
     )
