@@ -1,0 +1,40 @@
+{
+  "eval_set_id": "seat_based_smoke",
+  "name": "Seat-based MVP smoke eval set",
+  "description": "Minimal, checked-in golden eval set for the Mason upsell_ranker pipeline. One self-contained conversation that exercises the warehouse-profiling + signal-objective reasoning the dryfit `posthog_seat_based_mvp` scenario plants, WITHOUT requiring the live PostHog warehouse or Inspector. Used by `make eval-run` so the ADK 11-criteria evaluator has something to score the same way across model profiles (Gemini-3-Flash vs Opus baseline). Larger, warehouse-backed golden sets are generated from dryfit via `make eval-dataset` and live in Langfuse.",
+  "eval_cases": [
+    {
+      "eval_id": "seat_based_success_event_identification",
+      "conversation": [
+        {
+          "invocation_id": "seat-based-001",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "You are profiling a B2B SaaS warehouse for a seat-based collaboration product. The events table `events` has these event names with rough volumes over the last 90 days: `signed_up` (1200), `invited_teammate` (3400), `seat_assigned` (2900), `workspace_created` (1100), `subscription_started` (210), `feature_used` (54000), `seat_limit_reached` (180). Which single event is the strongest paid-conversion success signal, and name two leading product-usage signals that plausibly predict it? Answer concisely: success_event=<name>, then a short bulleted list of two predictive signals with one line of reasoning each."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "success_event=subscription_started\n\n- seat_limit_reached — accounts that hit their seat cap are demand-constrained and the most likely to upgrade to a paid plan.\n- invited_teammate / seat_assigned growth — rising seat assignment within an account signals expanding team adoption, the leading indicator of seat-based monetization."
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "upsell_ranker",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    }
+  ]
+}
