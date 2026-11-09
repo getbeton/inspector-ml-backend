@@ -1,5 +1,9 @@
 # Agent Systems Workspace
 
+> [!WARNING]
+> This repository is archived and read-only. The last Beton code is in [getbeton/inspector](https://github.com/getbeton/inspector). Beton is not in active development.
+> The team now builds [Sell to State](https://www.selltostate.com/?utm_source=github&utm_medium=referral&utm_campaign=beton-repos&utm_content=inspector-ml-backend): government tenders and contract awards from official sources in 70+ countries.
+
 ML/backend workspace for Beton's agentic analytics systems. This repo contains the backend agent logic that powers Beton product experiences around signal discovery, warehouse reasoning, and evidence-backed analysis workflows.
 
 ```mermaid
@@ -14,20 +18,18 @@ flowchart LR
     Scripts[Optional local scripts] -. probes .-> Outputs
 ```
 
-The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as [PostHog](https://www.getbeton.ai/integrations/posthog/), [Attio](https://www.getbeton.ai/integrations/attio/), and [similar integrations](https://www.getbeton.ai/integrations/) is planned but not implemented yet.
+The repo keeps multiple agent lineages side by side so architectural changes stay explicit. The latest versions of both projects are optimized for iterative analysis and are currently most reliable when deployed with Beton Inspector in front of protected systems. A standalone mode that connects directly to systems such as PostHog, Attio, and similar integrations is planned but not implemented yet.
 
 ## Product Context
 
 This repository is the `inspector-ml-backend` for Beton. It is not the full product surface by itself.
 
-- Product website: [www.getbeton.ai](https://www.getbeton.ai/)
-- Pricing and hosted trial: [www.getbeton.ai/pricing](https://www.getbeton.ai/pricing/)
-- Integrations catalog: [www.getbeton.ai/integrations](https://www.getbeton.ai/integrations/)
+- Beton repos: [github.com/getbeton](https://github.com/getbeton)
 - Demo stand / product-facing repo: `https://github.com/getbeton/inspector/tree/staging`
 
 Use those references to understand the product this backend connects to:
 
-- [getbeton.ai](https://www.getbeton.ai/) is the public product entry point for Beton.
+- [getbeton/inspector](https://github.com/getbeton/inspector) is the main Beton repo.
 - The `getbeton/inspector` staging branch is the demo stand and product-facing layer that sits in front of this ML/backend repo.
 - This repository provides the agent workflows and warehouse-analysis backend that the Beton product layer can call into.
 
@@ -134,7 +136,7 @@ TELEGRAM_DB_PASSWORD=
 
 - This repository is licensed under AGPLv3. See `LICENSE`.
 - Beton Inspector is currently the security-focused product path for protected warehouse access in the newest agent versions.
-- Direct standalone integration flags for systems such as [PostHog](https://www.getbeton.ai/integrations/posthog/) and [Attio](https://www.getbeton.ai/integrations/attio/) are planned.
+- Direct standalone integration flags for systems such as PostHog and Attio are planned.
 - Recent experiments show that explicitly defining the target metric for an agent is the strongest lever on analysis quality.
 
 ## Notes
@@ -148,12 +150,12 @@ TELEGRAM_DB_PASSWORD=
 
 ## About
 
-This backend is part of [Beton](https://www.getbeton.ai/), open-source revenue intelligence. The agent it powers is described at [getbeton.ai](https://www.getbeton.ai/), and its native data integrations are documented at [getbeton.ai/integrations](https://www.getbeton.ai/integrations/).
+This backend is part of [Beton](https://github.com/getbeton), open-source revenue intelligence. The agent it powers is [getbeton/inspector](https://github.com/getbeton/inspector).
 
 Related Beton open-source tools:
 
 - [Inspector](https://github.com/getbeton/inspector) — the front-end agent + workspace this backend serves
-- [DryFit](https://www.getbeton.ai/oss-tools/dryfit/) — synthetic analytics datasets for agent benchmarking
-- [openclaw-gtm-skills](https://www.getbeton.ai/oss-tools/openclaw-gtm-skills/) — company research pipeline for OpenClaw
+- [DryFit](https://github.com/getbeton/dryfit) — synthetic analytics datasets for agent benchmarking
+- [openclaw-gtm-skills](https://github.com/getbeton/openclaw-gtm-skills) — company research pipeline for OpenClaw
 
-Browse [all open-source tools by Beton →](https://www.getbeton.ai/oss-tools/)
+Browse [all open-source tools by Beton →](https://github.com/getbeton)
