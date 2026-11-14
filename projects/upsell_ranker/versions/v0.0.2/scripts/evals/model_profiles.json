@@ -1,0 +1,24 @@
+{
+  "_comment": "Model profiles for model-vs-model evals. Each profile is a set of env-var overrides applied (via os.environ) BEFORE the upsell_ranker agents are imported, so LiteLlm() at module-import picks up the right model_id per role. There is no native ADK compare mode: model-vs-model is done by running the SAME golden eval set once per profile and diffing the results (see eval_compare.py). Role env vars match agent.py: UPSELL_AGENT_MODEL, DWH_ANALYST_MODEL, SIGNAL_AGENT_MODEL, SIGNAL_REVIEWER_MODEL. All values are LiteLLM model strings.",
+  "profiles": {
+    "opus-baseline": {
+      "label": "Opus 4.6 baseline",
+      "env": {
+        "UPSELL_AGENT_MODEL": "anthropic/claude-opus-4-6",
+        "DWH_ANALYST_MODEL": "anthropic/claude-opus-4-6",
+        "SIGNAL_AGENT_MODEL": "anthropic/claude-opus-4-6",
+        "SIGNAL_REVIEWER_MODEL": "anthropic/claude-opus-4-6"
+      }
+    },
+    "gemini-3-flash": {
+      "label": "Gemini 3 Flash",
+      "env": {
+        "UPSELL_AGENT_MODEL": "gemini/gemini-3-flash",
+        "DWH_ANALYST_MODEL": "gemini/gemini-3-flash",
+        "SIGNAL_AGENT_MODEL": "gemini/gemini-3-flash",
+        "SIGNAL_REVIEWER_MODEL": "gemini/gemini-3-flash"
+      }
+    }
+  },
+  "default_compare": ["gemini-3-flash", "opus-baseline"]
+}
